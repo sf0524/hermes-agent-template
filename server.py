@@ -2363,21 +2363,48 @@ It may still be starting up, or it may have crashed.</p>
 </body></html>""" % HERMES_DASHBOARD_PORT
 
 
+def _dashboard_proxy_headers(
+    request_headers: dict[str, str], *, native_session_token: str
+) -> dict[str, str]:
+    """Build trusted headers for an edge-authenticated dashboard API request.
+
+    The Railway ``hermes_auth`` cookie is only valid at this edge. Native
+    Hermes separately requires its per-process session token, so an
+    untrusted client-provided native token never reaches the loopback server.
+    """
+    headers = {
+        key: value
+        for key, value in request_headers.items()
+        if key.lower() not in HOP_BY_HOP
+        and key.lower() != _SESSION_TOKEN_HEADER.lower()
+    }
+    headers[_SESSION_TOKEN_HEADER] = native_session_token
+    return headers
+
+
 async def _proxy_to_dashboard(request: Request) -> Response:
     """Forward an authenticated request to the Hermes dashboard subprocess.
 
-    Assumes edge auth (basic auth middleware) has already validated the caller.
-    HTTP-only: the native Hermes dashboard does not use WebSockets.
+    Assumes edge auth has already validated the caller. HTTP-only: the native
+    Hermes dashboard does not use WebSockets.
     """
     client = get_http_client()
     target = f"{HERMES_DASHBOARD_URL}{request.url.path}"
     if request.url.query:
         target = f"{target}?{request.url.query}"
 
-    req_headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in HOP_BY_HOP
-    }
+    try:
+        native_session_token = await _get_hermes_session_token()
+    except httpx.HTTPError as error:
+        print(f"[proxy] could not obtain native dashboard session token: {error}", flush=True)
+        return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
+    if not native_session_token:
+        print("[proxy] native dashboard did not expose a session token", flush=True)
+        return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
+
+    req_headers = _dashboard_proxy_headers(
+        dict(request.headers), native_session_token=native_session_token
+    )
     body = await request.body()
 
     try:
