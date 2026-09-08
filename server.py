@@ -1707,7 +1707,7 @@ def get_http_client() -> httpx.AsyncClient:
 _HERMES_SESSION_TOKEN_RE = re.compile(r'__HERMES_SESSION_TOKEN__\s*=\s*"([^"]*)"')
 
 
-async def _get_hermes_session_token() -> str:
+async def _get_hermes_session_token(session: dict[str, str] | None = None) -> str:
     """Scrape the dashboard's own ephemeral session token from its SPA shell.
 
     Hermes gates every non-public ``/api/*`` route behind a per-process
@@ -1730,7 +1730,12 @@ async def _get_hermes_session_token() -> str:
     below, not a crash.
     """
     client = get_http_client()
-    resp = await client.get(f"{HERMES_DASHBOARD_URL}/", timeout=httpx.Timeout(10.0))
+    headers = {}
+    if session:
+        headers["cookie"] = "; ".join(f"{k}={v}" for k, v in session.items())
+    resp = await client.get(
+        f"{HERMES_DASHBOARD_URL}/", headers=headers, timeout=httpx.Timeout(10.0)
+    )
     if resp.status_code != 200:
         # Gated mode (invariant 8): `/` 302s to the login page, so there is no
         # SPA shell and no token to scrape. Callers authenticate with the
@@ -2760,7 +2765,8 @@ def _dashboard_proxy_headers(
         if key.lower() not in HOP_BY_HOP
         and key.lower() != _SESSION_TOKEN_HEADER.lower()
     }
-    headers[_SESSION_TOKEN_HEADER] = native_session_token
+    if native_session_token:
+        headers[_SESSION_TOKEN_HEADER] = native_session_token
     return headers
 
 
@@ -2775,13 +2781,23 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     if request.url.query:
         target = f"{target}?{request.url.query}"
 
+    generation, session = hermes_session.snapshot()
+    # The public URL intentionally enables Hermes' own auth gate even though
+    # the dashboard binds loopback. Obtain the proxy-held login first; without
+    # its cookie, GET / only redirects to /login and exposes no SPA session token.
+    if not session and await hermes_session.refresh(generation):
+        generation, session = hermes_session.snapshot()
+
     try:
-        native_session_token = await _get_hermes_session_token()
+        native_session_token = await _get_hermes_session_token(session)
     except httpx.HTTPError as error:
         print(f"[proxy] could not obtain native dashboard session token: {error}", flush=True)
         return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
-    if not native_session_token:
-        print("[proxy] native dashboard did not expose a session token", flush=True)
+    # In gated mode, Hermes serves no SPA token at all: the held basic-auth
+    # cookie authenticates every route. Tokenless is only unavailable when we
+    # also failed to establish that server-held dashboard session.
+    if not native_session_token and not session:
+        print("[proxy] native dashboard exposed neither a session token nor an authenticated session", flush=True)
         return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
 
     req_headers = _dashboard_proxy_headers(
@@ -2796,7 +2812,6 @@ async def _proxy_to_dashboard(request: Request) -> Response:
             headers["cookie"] = merged
         return await client.request(request.method, target, headers=headers, content=body)
 
-    generation, session = hermes_session.snapshot()
     try:
         upstream = await send(session)
         # hermes' auth gate is on (we declare a public URL so MCP OAuth
@@ -2840,7 +2855,7 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     resp_headers = {
         k: v for k, v in upstream.headers.items()
         if k.lower() not in HOP_BY_HOP
-        and k.lower() not in ("content-encoding", "content-length")
+        and k.lower() not in ("content-encoding", "content-length", "set-cookie")
     }
 
     content = upstream.content
