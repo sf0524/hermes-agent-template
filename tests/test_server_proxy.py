@@ -52,6 +52,29 @@ class DashboardProxyHeadersTests(unittest.TestCase):
         self.assertNotIn("x-hermes-session-token", headers)
 
 
+class DashboardSessionTokenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_session_token_scrape_authenticates_with_held_dashboard_cookie(self):
+        class Client:
+            def __init__(self):
+                self.headers = None
+
+            async def get(self, _url, *, headers, timeout):
+                self.headers = headers
+                return httpx.Response(
+                    200,
+                    text='<script>window.__HERMES_SESSION_TOKEN__="native-token"</script>',
+                )
+
+        client = Client()
+        with patch.object(server, "get_http_client", return_value=client):
+            token = await server._get_hermes_session_token(
+                {"__Host-hermes_session": "held-session"}
+            )
+
+        self.assertEqual(token, "native-token")
+        self.assertEqual(client.headers["cookie"], "__Host-hermes_session=held-session")
+
+
 class DashboardProxyTests(unittest.IsolatedAsyncioTestCase):
     async def test_proxy_uses_scraped_native_token_not_client_token(self):
         request = Request(
@@ -74,6 +97,7 @@ class DashboardProxyTests(unittest.IsolatedAsyncioTestCase):
         client = _RecordingClient()
         with (
             patch.object(server, "get_http_client", return_value=client),
+            patch.object(server.hermes_session, "snapshot", return_value=(1, {"__Host-hermes_session": "held-session"})),
             patch.object(server, "_get_hermes_session_token", return_value="loopback-native-token"),
         ):
             response = await server._proxy_to_dashboard(request)
@@ -86,6 +110,66 @@ class DashboardProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["content"], b'{"read_only":true}')
         self.assertEqual(call["headers"][server._SESSION_TOKEN_HEADER], "loopback-native-token")
         self.assertNotIn("x-hermes-session-token", call["headers"])
+
+    async def test_proxy_strips_native_dashboard_set_cookie_from_response(self):
+        class CookieClient(_RecordingClient):
+            async def request(self, method, url, *, headers, content):
+                self.calls.append({"method": method, "url": url, "headers": headers, "content": content})
+                return httpx.Response(
+                    200,
+                    content=b'{"ok":true}',
+                    headers={
+                        "content-type": "application/json",
+                        "set-cookie": "__Host-hermes_session=server-held; Secure; HttpOnly",
+                    },
+                )
+
+        request = Request(
+            {
+                "type": "http", "method": "GET", "path": "/api/status", "query_string": b"",
+                "headers": [(b"host", b"edge.example")], "client": ("127.0.0.1", 12345),
+                "server": ("edge.example", 443), "scheme": "https",
+            },
+            await _receive_once(b""),
+        )
+        client = CookieClient()
+        with (
+            patch.object(server, "get_http_client", return_value=client),
+            patch.object(server.hermes_session, "snapshot", return_value=(1, {"__Host-hermes_session": "held-session"})),
+            patch.object(server, "_get_hermes_session_token", return_value=""),
+        ):
+            response = await server._proxy_to_dashboard(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("set-cookie", response.headers)
+
+    async def test_proxy_allows_gated_dashboard_session_without_spa_token(self):
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/api/status",
+                "query_string": b"",
+                "headers": [(b"host", b"edge.example")],
+                "client": ("127.0.0.1", 12345),
+                "server": ("edge.example", 443),
+                "scheme": "https",
+            },
+            await _receive_once(b""),
+        )
+        client = _RecordingClient()
+        with (
+            patch.object(server, "get_http_client", return_value=client),
+            patch.object(server.hermes_session, "snapshot", return_value=(1, {"__Host-hermes_session": "held-session"})),
+            patch.object(server, "_get_hermes_session_token", return_value=""),
+        ):
+            response = await server._proxy_to_dashboard(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(client.calls), 1)
+        call = client.calls[0]
+        self.assertEqual(call["headers"]["cookie"], "__Host-hermes_session=held-session")
+        self.assertNotIn(server._SESSION_TOKEN_HEADER, call["headers"])
 
 
 if __name__ == "__main__":
