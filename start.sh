@@ -48,27 +48,36 @@ if [ ! -f /data/.hermes/auth.json ] && [ -n "${HERMES_AUTH_JSON_BOOTSTRAP}" ]; t
   chmod 600 /data/.hermes/auth.json
 fi
 
-# Clear any stale gateway PID file left over from the previous container.
-# `hermes gateway` writes /data/.hermes/gateway.pid on start but does not
-# remove it on SIGTERM. Since /data is a persistent volume, the file
-# survives container restarts and causes every subsequent boot to exit with
-# "ERROR gateway.run: PID file race lost to another gateway instance".
-# No hermes process can be running at this point (we're pre-exec in a fresh
-# container), so removing the file unconditionally is safe.
-rm -f /data/.hermes/gateway.pid
+# Clear stale gateway runtime files left over from the previous container.
+# hermes writes these on start but does not remove them on SIGTERM, and /data
+# is a persistent volume, so they survive into the next boot:
+#   gateway.pid   -> "PID file race lost to another gateway instance"
+#   gateway.lock  -> since v2026.8.27 get_running_pid() also consults the lock,
+#                    and the new cross-profile gate makes `--replace` REFUSE a
+#                    pid it cannot prove owns this HERMES_HOME (gateway/run.py
+#                    "Refusing --replace"), which no retry can clear
+#   gateway.sock  -> a stale control socket blocks the fresh bind
+# No hermes process can be running here (we are pre-exec in a fresh
+# container), so removing all three unconditionally is safe.
+rm -f /data/.hermes/gateway.pid /data/.hermes/gateway.lock /data/.hermes/gateway.sock
 
-# Tell the dashboard its externally reachable URL.
-# hermes >= v2026.7.20 builds the MCP OAuth redirect_uri from the request's own
-# Host header. Our reverse proxy must strip that Host (hermes 400s anything but
-# loopback on a loopback bind), so hermes would otherwise hand the OAuth
-# provider `http://127.0.0.1:9119/...` — a URL only reachable inside this
-# container, leaving the browser on a dead tab after consent with nothing in the
-# logs. resolve_public_url() checks HERMES_DASHBOARD_PUBLIC_URL first, so
-# setting it is the supported fix. Railway injects RAILWAY_PUBLIC_DOMAIN; `:=`
-# keeps an operator-set value (e.g. a custom domain) winning.
-if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
-  : "${HERMES_DASHBOARD_PUBLIC_URL:=https://${RAILWAY_PUBLIC_DOMAIN}}"
-  export HERMES_DASHBOARD_PUBLIC_URL
-fi
+
+# Durable lazy-install target for opt-in backends (supermemory, mem0, firecrawl, etc.).
+# The template installs hermes into system Python (`uv pip install --system`) with no
+# venv, so `uv pip install` at runtime fails with "No virtual environment found." Set
+# HERMES_LAZY_INSTALL_TARGET to redirect runtime package installs into a writable dir
+# on the persistent volume — same mechanism the official Docker image bakes in. This
+# must be exported so the gateway process inherits it; hermes_bootstrap.py activates it
+# at startup. Without it, any lazy dep (including opt-in providers like supermemory)
+# fails on every fresh container deploy.
+mkdir -p /data/.hermes/lazy-packages
+export HERMES_LAZY_INSTALL_TARGET=/data/.hermes/lazy-packages
+
+# HERMES_DASHBOARD_PUBLIC_URL is deliberately NOT exported here. server.py owns
+# it: build_hermes_env() sets it only alongside the basic-auth credentials that
+# satisfy hermes' auth gate. Declaring the URL without them makes the dashboard
+# SystemExit at startup (v2026.8.27's should_require_dashboard_auth), and since
+# Dashboard has no respawn supervisor every proxied page 503s until redeploy
+# while /setup and /health stay green. Setting it here would skip that pairing.
 
 exec python /app/server.py

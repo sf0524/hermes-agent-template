@@ -628,6 +628,7 @@
     text-align: center;
   }
   .hint { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+  .hint.warn { color: var(--yellow); }
   code { font-family: var(--font-mono); color: var(--accent); }
   .field-gap { margin-top: 12px; }
 
@@ -1177,6 +1178,10 @@
                    :value="selectedProvider ? (vars[providerMap[selectedProvider]?.key]||'') : ''"
                    @input="if(selectedProvider && providerMap[selectedProvider]?.key) vars[providerMap[selectedProvider].key]=$event.target.value"
                    :placeholder="selectedProvider ? (providerMap[selectedProvider]?.placeholder||'Paste your API key') : ''">
+            <p class="hint warn" x-show="providerKeyPrefixMismatch">
+              This key doesn't start with <code x-text="providerMap[selectedProvider]?.keyPrefix"></code>.
+              Hermes will ignore it and the bot won't reply — check you copied the whole key.
+            </p>
           </div>
 
           <!-- AWS Bedrock extra fields (after Access Key ID) -->
@@ -1834,6 +1839,78 @@
         </div>
 
         <div class="changelog-entry major">
+          <div class="changelog-date">September 6, 2026</div>
+          <div class="changelog-meta">
+            <span class="meta-box">
+              <span class="meta-label">Git branch</span>
+              <code>release/v2026.8.31/1</code>
+            </span>
+            <span class="meta-box version">
+              <span class="meta-label">Hermes compatible version</span>
+              <code>v2026.8.31</code>
+            </span>
+          </div>
+
+          <div class="changelog-group">Hermes update</div>
+          <ul class="changelog-list">
+            <li>Updated <strong>Hermes Agent to v2026.8.31</strong> (from v2026.8.27). Three more AI providers &mdash; <strong>Tencent TokenPlan</strong>, <strong>Ramp Router</strong> and <strong>Nebius</strong> &mdash; are available from the Hermes Dashboard &rarr; Keys tab, and Kanban boards can now be exported and imported.</li>
+            <li><strong>Scanned PDFs can be read now.</strong> If you have a Firecrawl key saved, pages that are just images of text get sent for OCR instead of coming back empty.</li>
+            <li><strong>Messaging the bot while it is still answering gets a reply.</strong> Hermes used to hold that message silently for up to 30 minutes; it now tells you within a few seconds to resend once the current answer is finished.</li>
+            <li><strong>Connecting a Claude Pro/Max subscription moved out of the dashboard.</strong> Hermes removed that button for policy reasons. Open the <strong>Chat</strong> tab's terminal and run <code>hermes auth add anthropic</code> instead &mdash; plain Anthropic API keys are unaffected.</li>
+          </ul>
+
+          <div class="changelog-group">Changes to support upstream updates</div>
+          <ul class="changelog-list">
+            <li><strong>Reading PDFs and Office files keeps working.</strong> Hermes made its document reader a built-in part of the package. This template used to install its own copy on top, which would now replace it with an older version Hermes then refuses to use &mdash; every PDF, Word, Excel and PowerPoint read would have failed on every deploy, retrying silently in the background forever. The extra copy is gone.</li>
+            <li><strong>Tavily search was removed from Hermes, so Setup offers Keenable instead.</strong> If you had picked Tavily as your search engine in the Hermes <strong>Tools</strong> tab, pick another one there &mdash; searches error until you do. Any Tavily key you saved is left untouched, just unused.</li>
+            <li><strong>Restarting waits for the bot to finish writing to disk.</strong> Hermes now takes longer to shut down when a scheduled job is running, and we were cutting it off part-way &mdash; something Hermes itself now documents as a cause of database corruption.</li>
+            <li><strong>Temporary files stay out of your storage.</strong> Hermes moved the bot's command scratch space onto your data volume; it is back in the container's temporary space, so backups stay small and a restore can't be blocked by leftovers.</li>
+          </ul>
+
+          <div class="changelog-group">Bug fixes</div>
+          <ul class="changelog-list">
+            <li><strong>Switching profiles from the Chat terminal no longer hijacks the bot.</strong> Running <code>hermes profile use</code> could quietly move the bot and the dashboard onto that profile at the next restart, so your approved users and settings appeared to vanish while the bot kept running as someone else.</li>
+            <li><strong>Dashboard sign-in keys saved into the config file can no longer lock you out.</strong> If they ever landed there &mdash; through a restore or the Keys tab &mdash; every Hermes page showed a sign-in error until a redeploy. They are now removed automatically at startup.</li>
+            <li><strong>A broken configuration no longer restarts in a loop.</strong> When the bot cannot start because of a settings problem, the gateway now stops and says so plainly instead of retrying the same failure five times.</li>
+          </ul>
+        </div>
+
+        <div class="changelog-entry major">
+          <div class="changelog-date">August 29, 2026</div>
+          <div class="changelog-meta">
+            <span class="meta-box">
+              <span class="meta-label">Git branch</span>
+              <code>release/v2026.8.27/1</code>
+            </span>
+            <span class="meta-box version">
+              <span class="meta-label">Hermes compatible version</span>
+              <code>v2026.8.27</code>
+            </span>
+          </div>
+
+          <div class="changelog-group">Hermes update</div>
+          <ul class="changelog-list">
+            <li>Updated <strong>Hermes Agent to v2026.8.27</strong> (from v2026.8.13), covering five upstream releases. Eleven more AI providers are available from the Hermes Dashboard &rarr; Keys tab, and everything you had configured keeps working unchanged.</li>
+            <li><strong>Helper agents work harder by default.</strong> When the bot splits a task into helpers, Hermes raised both how many steps each helper may take (50 → 250) and how many run at once (3 → 10). Both are Hermes' own new defaults, left as-is. The step limit only changes for brand-new deployments, but <em>the parallel limit applies to everyone straight away</em> — so a busy bot can do more at once, and spend more with your provider.</li>
+          </ul>
+
+          <div class="changelog-group">Changes to support upstream updates</div>
+          <ul class="changelog-list">
+            <li><strong>The Hermes dashboard keeps working — and MCP tool sign-ins now work too.</strong> Hermes now treats a deployment that advertises a public web address as one that must have its own password, and shuts the dashboard down at startup when it doesn't. On Railway that address is filled in automatically, so Chat, Keys, Kanban and every other Hermes page would have shown &ldquo;Dashboard unavailable&rdquo; on every deploy — while this admin panel and the health check stayed perfectly green. That same address is what Hermes uses to send you back after approving an MCP tool login, so simply dropping it would have quietly broken those. Instead, the Hermes dashboard now has its own password — set automatically from your admin login — and this template signs in for you behind the scenes. <strong>You still sign in once, exactly as before.</strong></li>
+            <li><strong>The sign-in page moved to <code>/setup/login</code>.</strong> Old links still work. If you had bookmarked the login page directly, it will redirect you.</li>
+            <li><strong>Restoring a backup works again.</strong> Hermes started leaving three more folders out of backups. Our safety check didn't know that and could refuse a perfectly good archive with &ldquo;couldn't create a complete safety snapshot&rdquo;, blocking the restore entirely.</li>
+            <li><strong>The bot can no longer switch itself off.</strong> Hermes relaxed the rule that stopped the agent shutting down its own gateway, so a stray instruction could take the bot offline. This template now identifies itself as the supervisor, which restores the block.</li>
+            <li><strong>Scheduled jobs finish before a restart.</strong> Hermes now waits for a running scheduled job to complete when shutting down. We were cutting it off too early, killing the job halfway and leaving it stuck as &ldquo;running&rdquo;.</li>
+            <li><strong>Leftover lock files are cleared on boot</strong>, so a new safety check in Hermes can't leave the bot unable to restart.</li>
+          </ul>
+
+          <div class="changelog-group">Improvements</div>
+          <ul class="changelog-list">
+            <li><strong>A mistyped OpenRouter key is caught before you save.</strong> Hermes now ignores any OpenRouter key that doesn't begin with <code>sk-or-</code>, without showing an error anywhere — the bot simply never replies. Setup now warns you the moment the pasted key can't work.</li>
+          </ul>
+        </div>
+
+        <div class="changelog-entry major">
           <div class="changelog-date">August 15, 2026</div>
           <div class="changelog-meta">
             <span class="meta-box">
@@ -2034,7 +2111,7 @@ function app() {
   const tools = [
     { key: 'PARALLEL_API_KEY',       label: 'Parallel (search)',         secret: true  },
     { key: 'FIRECRAWL_API_KEY',      label: 'Firecrawl (scraping)',       secret: true  },
-    { key: 'TAVILY_API_KEY',         label: 'Tavily (search)',            secret: true  },
+    { key: 'KEENABLE_API_KEY',       label: 'Keenable (search)',          secret: true  },
     { key: 'FAL_KEY',                label: 'FAL (image gen)',            secret: true  },
     { key: 'BROWSERBASE_API_KEY',    label: 'Browserbase',                secret: true  },
     { key: 'GITHUB_TOKEN',           label: 'GitHub',                     secret: true  },
@@ -2074,7 +2151,11 @@ function app() {
     tools,
 
     providerMap: {
-      'OpenRouter':           { key: 'OPENROUTER_API_KEY',  modelKey: '_MODEL_OPENROUTER_API_KEY',  placeholder: 'sk-or-...' },
+      // keyPrefix mirrors hermes' KNOWN_PROVIDER_KEY_PREFIXES (hermes_cli/auth.py,
+      // new in v2026.8.27). Hermes SKIPS a key that fails the prefix and only logs
+      // a warning, so without this the bot just never answers. Re-check on a bump —
+      // OpenRouter is the only provider upstream declares a prefix for today.
+      'OpenRouter':           { key: 'OPENROUTER_API_KEY',  modelKey: '_MODEL_OPENROUTER_API_KEY',  placeholder: 'sk-or-...', keyPrefix: 'sk-or-' },
       'DeepSeek':             { key: 'DEEPSEEK_API_KEY',    modelKey: '_MODEL_DEEPSEEK_API_KEY',    placeholder: 'sk-...'    },
       'Qwen Cloud':           { key: 'DASHSCOPE_API_KEY',   modelKey: '_MODEL_DASHSCOPE_API_KEY',   placeholder: ''          },
       'GLM / Z.AI':           { key: 'GLM_API_KEY',         modelKey: '_MODEL_GLM_API_KEY',         placeholder: ''          },
@@ -2139,6 +2220,15 @@ function app() {
 
     get isSetupDone() {
       return this.configuredProviders.length > 0 && !!this.vars.LLM_MODEL;
+    },
+
+    // True once a typed key provably can't work: hermes drops a key failing the
+    // provider's declared prefix and only logs it, so warn here instead.
+    get providerKeyPrefixMismatch() {
+      const p = this.providerMap[this.selectedProvider];
+      if (!p?.keyPrefix || !p.key) return false;
+      const value = (this.vars[p.key] || '').trim();
+      return value.length > 0 && !value.startsWith(p.keyPrefix);
     },
 
     onProviderChange() {
