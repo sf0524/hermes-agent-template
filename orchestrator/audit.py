@@ -5,6 +5,12 @@ outbox enqueue/dispatch/fail, policy rejection) records one row here in the
 same transaction as the change it's auditing. There is deliberately no
 update/delete method — ``audit_log_no_update``/``audit_log_no_delete``
 triggers (schema.py) enforce that at the DB level too.
+
+``record`` redacts every caller-controlled persisted field centrally (via
+``orchestrator.health.redact``) before it is ever written, rather than
+trusting every call site elsewhere in the package to remember to redact its
+own caller-controlled fields — a caller that redacts anyway just gets a
+no-op re-redaction.
 """
 
 from __future__ import annotations
@@ -54,21 +60,38 @@ class AuditLog:
         detail: dict[str, Any] | None = None,
         now: str | None = None,
     ) -> AuditEntry:
+        # Deferred import: health.py imports AuditEntry/AuditLog from this
+        # module at module load time, so importing health.py back at *this*
+        # module's load time would be circular. By the time record() actually
+        # runs, both modules have finished loading and this is a normal cache
+        # hit (same pattern as schema.py's deferred import of db.py).
+        from orchestrator.health import redact
+
         recorded_at = now or _utcnow()
+        redacted_actor = redact(actor)
+        redacted_action = redact(action)
+        redacted_subject_id = redact(subject_id) if subject_id is not None else None
+        redacted_detail = redact(detail) if detail is not None else None
         cur = self._conn.execute(
             """
             INSERT INTO audit_log (recorded_at, actor, action, subject_id, detail)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (recorded_at, actor, action, subject_id, json.dumps(detail) if detail is not None else None),
+            (
+                recorded_at,
+                redacted_actor,
+                redacted_action,
+                redacted_subject_id,
+                json.dumps(redacted_detail) if redacted_detail is not None else None,
+            ),
         )
         return AuditEntry(
             id=cur.lastrowid,
             recorded_at=recorded_at,
-            actor=actor,
-            action=action,
-            subject_id=subject_id,
-            detail=detail,
+            actor=redacted_actor,
+            action=redacted_action,
+            subject_id=redacted_subject_id,
+            detail=redacted_detail,
         )
 
     def list_for_subject(self, subject_id: str) -> list[AuditEntry]:
