@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from orchestrator.action_gateway import (
     CATEGORY_A_ACTION_TYPES,
@@ -14,6 +15,7 @@ from orchestrator.action_gateway import (
     RailwayActionInterface,
     TransportDisabledError,
     UnknownActionTypeError,
+    default_transport,
 )
 from orchestrator.audit import AuditLog
 from orchestrator.db import connect, transaction
@@ -33,7 +35,14 @@ class _SpyTransport:
         self.calls.append(intent)
 
 
-class ActionGatewayCategoryATests(unittest.TestCase):
+class _TransportPatchMixin:
+    def use_transport(self, transport):
+        patcher = patch("orchestrator.action_gateway.default_transport", transport)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class ActionGatewayCategoryATests(_TransportPatchMixin, unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -41,7 +50,8 @@ class ActionGatewayCategoryATests(unittest.TestCase):
         self.addCleanup(self.conn.close)
         self.grants = HumanOwnerGrants(self.conn)
         self.transport = _SpyTransport()
-        self.gateway = ActionGateway(self.conn, grants=self.grants, transport=self.transport)
+        self.use_transport(self.transport)
+        self.gateway = ActionGateway(self.conn, grants=self.grants)
 
     def test_every_category_a_action_type_is_always_rejected(self):
         for action_type in sorted(CATEGORY_A_ACTION_TYPES):
@@ -94,7 +104,7 @@ class ActionGatewayCategoryATests(unittest.TestCase):
         self.assertEqual(len(rejected), 1)
 
 
-class ActionGatewayDefaultDenyTests(unittest.TestCase):
+class ActionGatewayDefaultDenyTests(_TransportPatchMixin, unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -102,7 +112,8 @@ class ActionGatewayDefaultDenyTests(unittest.TestCase):
         self.addCleanup(self.conn.close)
         self.grants = HumanOwnerGrants(self.conn)
         self.transport = _SpyTransport()
-        self.gateway = ActionGateway(self.conn, grants=self.grants, transport=self.transport)
+        self.use_transport(self.transport)
+        self.gateway = ActionGateway(self.conn, grants=self.grants)
 
     def test_unknown_action_type_is_rejected_fail_closed(self):
         for action_type in ("github_merge_pr", "railway_deploy", "railway_release", "totally_unheard_of"):
@@ -151,7 +162,7 @@ class ActionGatewayDefaultDenyTests(unittest.TestCase):
             )
 
 
-class ActionGatewayCategoryBTests(unittest.TestCase):
+class ActionGatewayCategoryBTests(_TransportPatchMixin, unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -160,7 +171,8 @@ class ActionGatewayCategoryBTests(unittest.TestCase):
         self.addCleanup(self.conn.close)
         self.grants = HumanOwnerGrants(self.conn)
         self.transport = _SpyTransport()
-        self.gateway = ActionGateway(self.conn, grants=self.grants, transport=self.transport)
+        self.use_transport(self.transport)
+        self.gateway = ActionGateway(self.conn, grants=self.grants)
         self.grants.record(
             grant_id="g1", scope="github:acme/widgets", subject="pr-42",
             action_type="github_comment", payload_digest=canonical_payload_digest({"body": "hi"}),
@@ -348,15 +360,23 @@ class ActionGatewayCategoryBTests(unittest.TestCase):
 
     def test_default_shipped_transport_is_disabled(self):
         gateway = ActionGateway(self.conn, grants=self.grants)  # no transport override: shipped default
-        with self.assertRaises(TransportDisabledError):
-            gateway.dispatch(
-                idempotency_key="shipped-1", consumer="runtime_orchestrator", action_type="github_comment",
-                target_scope="github:acme/widgets", subject="pr-42", payload={"body": "hi"}, grant_id="g1",
-            )
+        with patch("orchestrator.action_gateway.default_transport", default_transport):
+            with self.assertRaises(TransportDisabledError):
+                gateway.dispatch(
+                    idempotency_key="shipped-1", consumer="runtime_orchestrator", action_type="github_comment",
+                    target_scope="github:acme/widgets", subject="pr-42", payload={"body": "hi"}, grant_id="g1",
+                )
         record = gateway.get("shipped-1")
         self.assertEqual(record.status, "failed")
         # grant was durably consumed before the disabled transport was ever reached
         self.assertIsNotNone(self.grants.get("g1").consumed_at)
+
+    def test_public_gateway_constructor_rejects_arbitrary_transport_injection(self):
+        """Production Category B dispatch must have no public path to a real
+        external transport; tests exercise the disabled stub by patching it at
+        its module seam instead of passing a callable through this API."""
+        with self.assertRaises(TypeError):
+            ActionGateway(self.conn, grants=self.grants, transport=_SpyTransport())
 
     def test_intent_and_grant_consumption_are_audited(self):
         self.gateway.dispatch(
@@ -368,7 +388,7 @@ class ActionGatewayCategoryBTests(unittest.TestCase):
         self.assertIn("action.dispatched", actions)
 
 
-class ActionGatewayRecordIntentRaceTests(unittest.TestCase):
+class ActionGatewayRecordIntentRaceTests(_TransportPatchMixin, unittest.TestCase):
     """Exercises _record_intent's in-lock recheck directly: a second caller
     that raced dispatch()'s pre-check (both saw no existing row) and reached
     _record_intent after a concurrent winner already inserted the row under
@@ -381,7 +401,8 @@ class ActionGatewayRecordIntentRaceTests(unittest.TestCase):
         self.addCleanup(self.conn.close)
         self.grants = HumanOwnerGrants(self.conn)
         self.transport = _SpyTransport()
-        self.gateway = ActionGateway(self.conn, grants=self.grants, transport=self.transport)
+        self.use_transport(self.transport)
+        self.gateway = ActionGateway(self.conn, grants=self.grants)
         self.grants.record(
             grant_id="g1", scope="github:acme/widgets", subject="pr-42",
             action_type="github_comment", payload_digest=canonical_payload_digest({"body": "hi"}),
@@ -429,7 +450,7 @@ class ActionGatewayRecordIntentRaceTests(unittest.TestCase):
         self.assertEqual(second.grant_id, "g1")
 
 
-class ActionGatewayRestartReconciliationTests(unittest.TestCase):
+class ActionGatewayRestartReconciliationTests(_TransportPatchMixin, unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -467,7 +488,8 @@ class ActionGatewayRestartReconciliationTests(unittest.TestCase):
         reconnected = connect(self.db_path)
         self.addCleanup(reconnected.close)
         spy = _SpyTransport()
-        resumed_gateway = ActionGateway(reconnected, transport=spy)
+        self.use_transport(spy)
+        resumed_gateway = ActionGateway(reconnected)
         results = resumed_gateway.reconcile_pending()
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].status, "dispatched")
@@ -499,7 +521,8 @@ class ActionGatewayRestartReconciliationTests(unittest.TestCase):
         reconnected = connect(self.db_path)
         self.addCleanup(reconnected.close)
         spy = _SpyTransport()
-        resumed_gateway = ActionGateway(reconnected, transport=spy)
+        self.use_transport(spy)
+        resumed_gateway = ActionGateway(reconnected)
         results = resumed_gateway.reconcile_pending()
 
         self.assertEqual(len(spy.calls), 0)
@@ -517,7 +540,8 @@ class ActionGatewayRestartReconciliationTests(unittest.TestCase):
 
     def test_reconcile_pending_never_recalls_an_already_dispatched_intent(self):
         spy = _SpyTransport()
-        gateway = ActionGateway(self.conn, grants=self.grants, transport=spy)
+        self.use_transport(spy)
+        gateway = ActionGateway(self.conn, grants=self.grants)
         gateway.dispatch(
             idempotency_key="intent-1", consumer="runtime_orchestrator", action_type="github_comment",
             target_scope="github:acme/widgets", subject="pr-42", payload={"body": "hi"}, grant_id="g1",
@@ -531,7 +555,8 @@ class ActionGatewayRestartReconciliationTests(unittest.TestCase):
         """Simulates two processes reconciling concurrently: once one of them
         claims and dispatches the pending intent, the other must not call
         transport for it too."""
-        gateway_a = ActionGateway(self.conn, grants=self.grants, transport=lambda intent: None)
+        self.use_transport(lambda intent: None)
+        gateway_a = ActionGateway(self.conn, grants=self.grants)
         gateway_a.dispatch(
             idempotency_key="intent-1", consumer="runtime_orchestrator", action_type="github_comment",
             target_scope="github:acme/widgets", subject="pr-42", payload={"body": "hi"}, grant_id="g1",
@@ -544,16 +569,18 @@ class ActionGatewayRestartReconciliationTests(unittest.TestCase):
         other_conn = connect(self.db_path)
         self.addCleanup(other_conn.close)
         spy_a, spy_b = _SpyTransport(), _SpyTransport()
-        reconciler_a = ActionGateway(self.conn, transport=spy_a)
-        reconciler_b = ActionGateway(other_conn, transport=spy_b)
+        reconciler_a = ActionGateway(self.conn)
+        reconciler_b = ActionGateway(other_conn)
 
-        reconciler_a.reconcile_pending()
-        reconciler_b.reconcile_pending()  # must see it already dispatched
+        with patch("orchestrator.action_gateway.default_transport", spy_a):
+            reconciler_a.reconcile_pending()
+        with patch("orchestrator.action_gateway.default_transport", spy_b):
+            reconciler_b.reconcile_pending()  # must see it already dispatched
 
         self.assertEqual(len(spy_a.calls) + len(spy_b.calls), 1)
 
 
-class GitHubActionInterfaceTests(unittest.TestCase):
+class GitHubActionInterfaceTests(_TransportPatchMixin, unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -561,7 +588,8 @@ class GitHubActionInterfaceTests(unittest.TestCase):
         self.addCleanup(self.conn.close)
         self.grants = HumanOwnerGrants(self.conn)
         self.transport = _SpyTransport()
-        self.gateway = ActionGateway(self.conn, grants=self.grants, transport=self.transport)
+        self.use_transport(self.transport)
+        self.gateway = ActionGateway(self.conn, grants=self.grants)
         self.github = GitHubActionInterface(self.gateway)
 
     def test_happy_path_scopes_to_the_named_repo(self):
@@ -600,7 +628,7 @@ class GitHubActionInterfaceTests(unittest.TestCase):
         self.assertEqual(self.transport.calls, [])
 
 
-class RailwayActionInterfaceTests(unittest.TestCase):
+class RailwayActionInterfaceTests(_TransportPatchMixin, unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -608,7 +636,8 @@ class RailwayActionInterfaceTests(unittest.TestCase):
         self.addCleanup(self.conn.close)
         self.grants = HumanOwnerGrants(self.conn)
         self.transport = _SpyTransport()
-        self.gateway = ActionGateway(self.conn, grants=self.grants, transport=self.transport)
+        self.use_transport(self.transport)
+        self.gateway = ActionGateway(self.conn, grants=self.grants)
         self.railway = RailwayActionInterface(self.gateway)
 
     def test_happy_path_restart_service_scopes_to_the_named_project(self):
@@ -636,13 +665,15 @@ class RailwayActionInterfaceTests(unittest.TestCase):
             self.assertNotIn(action_type, CATEGORY_B_ACTION_SCOPES)
 
 
-class ActionGatewayAuditRedactionTests(unittest.TestCase):
+class ActionGatewayAuditRedactionTests(_TransportPatchMixin, unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.conn = connect(Path(self._tmp.name) / "state.db")
         self.addCleanup(self.conn.close)
         self.grants = HumanOwnerGrants(self.conn)
+        self.transport = _SpyTransport()
+        self.use_transport(self.transport)
 
     def test_unknown_action_rejection_audit_redacts_bearer_token(self):
         """A caller-supplied action_type string is untrusted input -- it may
@@ -652,7 +683,7 @@ class ActionGatewayAuditRedactionTests(unittest.TestCase):
         token = "abc123reallysecrettoken"
         action_type = f"totally_unheard_of Authorization: Bearer {token}"
         transport = _SpyTransport()
-        gateway = ActionGateway(self.conn, grants=self.grants, transport=transport)
+        gateway = ActionGateway(self.conn, grants=self.grants)
 
         with self.assertRaises(UnknownActionTypeError):
             gateway.dispatch(
@@ -685,18 +716,18 @@ class ActionGatewayAuditRedactionTests(unittest.TestCase):
             action_type="github_comment", payload_digest=canonical_payload_digest({"body": "hi"}),
             granted_by="owner@example.com",
         )
-        gateway = ActionGateway(self.conn, grants=self.grants, transport=failing_transport)
-
-        with self.assertRaises(RuntimeError):
-            gateway.dispatch(
-                idempotency_key="transport-fail",
-                consumer="runtime_orchestrator",
-                action_type="github_comment",
-                target_scope="github:acme/widgets",
-                subject="pr-42",
-                payload={"body": "hi"},
-                grant_id="g1",
-            )
+        gateway = ActionGateway(self.conn, grants=self.grants)
+        with patch("orchestrator.action_gateway.default_transport", failing_transport):
+            with self.assertRaises(RuntimeError):
+                gateway.dispatch(
+                    idempotency_key="transport-fail",
+                    consumer="runtime_orchestrator",
+                    action_type="github_comment",
+                    target_scope="github:acme/widgets",
+                    subject="pr-42",
+                    payload={"body": "hi"},
+                    grant_id="g1",
+                )
 
         failed = [e for e in AuditLog(self.conn).all() if e.action == "action.failed"]
         self.assertEqual(len(failed), 1)
@@ -710,7 +741,7 @@ class ActionGatewayAuditRedactionTests(unittest.TestCase):
         persists it verbatim (unlike the two paths above, which already call
         ``redact`` explicitly)."""
         token = "scope-mismatch-secret-123"
-        gateway = ActionGateway(self.conn, grants=self.grants, transport=_SpyTransport())
+        gateway = ActionGateway(self.conn, grants=self.grants)
 
         with self.assertRaises(GrantMismatchError):
             gateway.dispatch(
@@ -741,7 +772,7 @@ class ActionGatewayAuditRedactionTests(unittest.TestCase):
             action_type="github_comment", payload_digest=canonical_payload_digest({"body": "hi"}),
             granted_by="owner@example.com",
         )
-        gateway = ActionGateway(self.conn, grants=self.grants, transport=_SpyTransport())
+        gateway = ActionGateway(self.conn, grants=self.grants)
 
         gateway.dispatch(
             idempotency_key="intent-secret",

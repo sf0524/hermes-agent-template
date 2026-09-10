@@ -24,11 +24,10 @@ passes in:
   is rejected fail-closed by the same default-deny discipline
   ``orchestrator/policy.py`` uses for the outbox.
 
-The transport that actually sends a Category B action anywhere is injected;
-the shipped default (``default_transport``) always raises
-``TransportDisabledError`` — no real external call is wired into this
-deployment. Tests inject a test-double transport to exercise the positive
-path. Each idempotency key's transport call happens at most once: the
+The only Category B transport is the shipped ``default_transport``, which
+always raises ``TransportDisabledError`` — no real external call is wired
+into this deployment. Tests patch that disabled stub at its module seam to
+exercise durable state transitions. Each idempotency key's transport call happens at most once: the
 pending -> dispatching status transition is claimed atomically (an
 ``UPDATE ... WHERE status = 'pending'``, whose row-lock serializes
 concurrent claimants), and a dispatched or terminally-failed intent is never
@@ -47,7 +46,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 from orchestrator.audit import AuditLog
 from orchestrator.db import transaction
@@ -165,11 +164,9 @@ class ActionGateway:
         conn: sqlite3.Connection,
         *,
         grants: HumanOwnerGrants | None = None,
-        transport: Callable[[ActionIntentRecord], None] | None = None,
     ):
         self._conn = conn
         self._grants = grants or HumanOwnerGrants(conn)
-        self._transport = transport or default_transport
 
     def dispatch(
         self,
@@ -388,7 +385,6 @@ class ActionGateway:
         record: ActionIntentRecord,
         *,
         now: str | None = None,
-        transport: Callable[[ActionIntentRecord], None] | None = None,
     ) -> ActionIntentRecord:
         if record.status in ("dispatched", "failed"):
             return record
@@ -405,10 +401,9 @@ class ActionGateway:
         if not claimed:
             return self.get(record.idempotency_key)
 
-        active_transport = transport or self._transport
         claimed_record = self.get(record.idempotency_key)
         try:
-            active_transport(claimed_record)
+            default_transport(claimed_record)
         except Exception as exc:
             self._finish(record.idempotency_key, "failed", detail=redact({"reason": str(exc)}))
             raise
@@ -442,9 +437,7 @@ class ActionGateway:
         ).fetchone()
         return ActionIntentRecord._from_row(row) if row is not None else None
 
-    def reconcile_pending(
-        self, *, transport: Callable[[ActionIntentRecord], None] | None = None
-    ) -> list[ActionIntentRecord]:
+    def reconcile_pending(self) -> list[ActionIntentRecord]:
         """Resume every intent left at ``pending``, and surface every intent
         stuck at ``dispatching``, by a crashed prior process.
 
@@ -473,7 +466,7 @@ class ActionGateway:
                 self._record_recovery_required(record)
                 results.append(record)
                 continue
-            results.append(self._claim_and_dispatch(record, transport=transport))
+            results.append(self._claim_and_dispatch(record))
         return results
 
     def _record_recovery_required(self, record: ActionIntentRecord) -> None:

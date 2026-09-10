@@ -841,6 +841,25 @@ class AuditLogRedactionTests(unittest.TestCase):
         row = self.conn.execute("SELECT detail FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
         self.assertNotIn(secret, row["detail"])
 
+    def test_record_redacts_caller_controlled_scalar_fields_before_persisting(self):
+        actor_secret = "actor-secret-123"
+        action_secret = "action-secret-456"
+        subject_secret = "subject-secret-789"
+        entry = self.audit.record(
+            actor=f"operator Authorization: Bearer {actor_secret}",
+            action=f"unit.test?token={action_secret}",
+            subject_id=f"subject?token={subject_secret}",
+            detail={"nested": {"token": "detail-secret"}, "safe": "keep-me"},
+        )
+        row = self.conn.execute(
+            "SELECT actor, action, subject_id, detail FROM audit_log WHERE id = ?", (entry.id,)
+        ).fetchone()
+        persisted = json.dumps(dict(row))
+        for secret in (actor_secret, action_secret, subject_secret, "detail-secret"):
+            self.assertNotIn(secret, persisted)
+        self.assertIn(REDACTED_VALUE, persisted)
+        self.assertEqual(entry.detail["safe"], "keep-me")
+
     def test_nonsecret_detail_is_preserved_exactly(self):
         entry = self.audit.record(
             actor="test", action="unit.test", detail={"action_type": "github_comment", "count": 3}

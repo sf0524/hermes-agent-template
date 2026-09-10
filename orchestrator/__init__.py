@@ -11,8 +11,8 @@ GitHub or Railway: durable Human Owner grants (human_owner.py) and a
 target-scoped, default-deny action gateway (action_gateway.py) built on top
 of them. Category A actions (source mutation, waivers, role overrides,
 trading) have no dispatch route at all; Category B actions require an exact,
-immutable grant and dispatch through an injectable transport whose shipped
-default always refuses to make a real call.
+immutable grant but remain disabled: the shipped transport has no live
+dispatch path and always refuses to make a real call.
 
 Scope boundary: this package does not execute merges, releases, or any
 irreversible action, and does not wire into the gateway loop. It provides the
