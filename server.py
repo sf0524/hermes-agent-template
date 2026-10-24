@@ -599,7 +599,9 @@ def _restore_file_snapshot(path: Path, snapshot: tuple[bytes, int] | None) -> No
         Path(tmp_name).unlink(missing_ok=True)
 
 
-def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> None:
+def write_config_yaml(
+    data: dict[str, str], *, reset_model: bool = False, preserve_model: bool = False
+) -> None:
     """Write config.yaml — deep-merge template defaults with any existing user/cron-managed sections.
 
     Previously this overwrote ``$HERMES_HOME/config.yaml`` with a hardcoded template
@@ -613,6 +615,12 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
     (``model.default``, ``model.provider``, ``terminal``, ``agent``, ``data_dir``)
     on top, and write the merged result. Unknown top-level keys (``mcp_servers``,
     custom skill config, etc.) are preserved verbatim.
+
+    ``preserve_model=True`` makes the saved YAML ``model.default`` authoritative
+    (the user may have picked it in the native Hermes UI, which never updates
+    ``.env``'s LLM_MODEL): .env only seeds it when the YAML has none. Ordinary
+    gateway starts and saves that don't change LLM_MODEL use this; an explicit
+    model change or ``reset_model`` does not.
     """
     model = data.get("LLM_MODEL", "")
     config_path = Path(HERMES_HOME) / "config.yaml"
@@ -630,6 +638,9 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
         merged_model = {"default": ""}
     else:
         merged_model = dict(merged.get("model") if isinstance(merged.get("model"), dict) else {})
+        saved_default = merged_model.get("default")
+        if preserve_model and isinstance(saved_default, str) and saved_default.strip():
+            model = saved_default
         merged_model["default"] = model
         current_provider = str(merged_model.get("provider") or "").strip()
         # Only default to "auto" on a config that has never had a provider
@@ -1741,7 +1752,7 @@ class Gateway:
             # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
             if write_config:
                 async with cfg_lock:
-                    write_config_yaml(read_env(ENV_FILE))
+                    write_config_yaml(read_env(ENV_FILE), preserve_model=True)
             # --replace: force-displace any existing gateway.pid lock holder
             # before claiming it. Without this, a lock left behind by a prior
             # incarnation this supervisor doesn't recognize as "our" dead
@@ -2422,7 +2433,24 @@ async def api_config_put(request: Request):
                 previous_env = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else None
                 write_env(ENV_FILE, merged)
                 try:
-                    write_config_yaml(merged, reset_model=reset_removed_router_model)
+                    # An explicit model selection updates the desired model: either
+                    # LLM_MODEL actually changed, or the UI flagged a provider/model
+                    # pick (_active_provider_key) and sent LLM_MODEL — even if it
+                    # equals the stale .env value while native YAML differs.
+                    # Other saves must not overwrite a model chosen natively in
+                    # Hermes with a stale .env value.
+                    model_changed = merged.get("LLM_MODEL", "") != existing.get("LLM_MODEL", "")
+                    explicit_selection = bool(
+                        active_provider_key
+                        and isinstance(new_vars, dict)
+                        and "LLM_MODEL" in new_vars
+                        and merged.get("LLM_MODEL", "").strip()
+                    )
+                    write_config_yaml(
+                        merged,
+                        reset_model=reset_removed_router_model,
+                        preserve_model=not (model_changed or explicit_selection),
+                    )
                 except Exception:
                     # Config and .env are separate files. If the guarded config
                     # write refuses or fails, restore the exact prior credentials
