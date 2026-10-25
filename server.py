@@ -2464,7 +2464,10 @@ async def api_config_put(request: Request):
             model_warning = None
             hermes_provider_id = HERMES_PROVIDER_IDS.get(active_provider_key)
             model_value = merged.get("LLM_MODEL", "").strip()
-            if hermes_provider_id and model_value:
+            # Pin only a genuine provider+model pick. A provider key saved without
+            # LLM_MODEL would otherwise replay the stale .env model onto the
+            # provider and overwrite the pair chosen natively in Hermes.
+            if hermes_provider_id and model_value and explicit_selection:
                 pin_base_url = ""
                 pin_api_key = ""
                 if hermes_provider_id == "custom":

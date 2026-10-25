@@ -105,6 +105,37 @@ class PreserveNativeMainModelTests(ConfigSafetyFixture, unittest.IsolatedAsyncio
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(self._config()["model"]["default"], "native-choice")
 
+    def _fake_native_pin(self):
+        """Stand-in for hermes' POST /api/model/set that really rewrites the pair.
+
+        Writes into the fixture config only (never a live home), so a replayed
+        pin is visible in config.yaml instead of hiding behind a bare mock.
+        """
+        calls = []
+
+        async def pin(provider_id, model, *, base_url="", api_key=""):
+            calls.append((provider_id, model))
+            cfg = self._config()
+            cfg["model"] = {**cfg.get("model", {}), "provider": provider_id, "default": model}
+            self._write_config(cfg)
+            return None
+
+        return calls, pin
+
+    async def test_provider_key_without_model_var_does_not_replay_stale_env_pin(self):
+        self.server.guard = lambda _: None
+        self._write_env("OPENROUTER_API_KEY=k\nLLM_MODEL=stale-env-model\n")
+        self._write_config({"model": {"default": "gpt-6.1-sol", "provider": "openai-codex"}})
+        calls, pin = self._fake_native_pin()
+        with patch.object(self.server, "set_active_model_via_hermes", pin):
+            resp = await self.server.api_config_put(_Request({
+                "vars": {"OPENROUTER_API_KEY": "k"},
+                "_active_provider_key": "OPENROUTER_API_KEY", "_restart": False}))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(calls, [])
+        model = self._config()["model"]
+        self.assertEqual((model["provider"], model["default"]), ("openai-codex", "gpt-6.1-sol"))
+
     async def test_admin_explicit_model_change_updates_yaml(self):
         self.server.guard = lambda _: None
         self._write_env("OPENROUTER_API_KEY=k\nLLM_MODEL=old-env\n")
