@@ -179,7 +179,9 @@ class GatewayMaintenanceTests(ConfigSafetyFixture, unittest.IsolatedAsyncioTestC
                     self.server._proxy_to_dashboard.assert_not_awaited()
 
     async def test_unrelated_native_api_is_not_serialized_as_gateway_lifecycle(self):
-        request = Request({"type": "http", "method": "POST", "path": "/api/model/set", "headers": []})
+        # model/set now participates in setup's settings transaction; a
+        # read-only credential validation still bypasses that lifecycle lock.
+        request = Request({"type": "http", "method": "POST", "path": "/api/providers/validate", "headers": []})
         self.server._proxy_to_dashboard = AsyncMock(return_value=JSONResponse({"ok": True}))
         async with self.server.lifecycle_lock:
             response = await self.server.route_proxy(request)

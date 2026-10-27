@@ -629,6 +629,18 @@
   }
   .hint { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
   .hint.warn { color: var(--yellow); }
+  .codex-setup { --text-dim: #9ba6b6; }
+  .codex-setup h3 { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+  .codex-setup .hint { line-height: 1.6; margin-top: 8px; max-width: 75ch; }
+  .codex-setup .codex-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+  .codex-setup .codex-model { margin-top: 24px; }
+  .codex-model-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; }
+  .codex-model-row .btn { white-space: nowrap; min-height: 38px; }
+  .codex-setup .codex-ready { color: var(--green); margin-top: 12px; }
+  @media (max-width: 600px) {
+    .codex-model-row { grid-template-columns: 1fr; }
+    .codex-model-row .btn { width: 100%; }
+  }
   code { font-family: var(--font-mono); color: var(--accent); }
   .field-gap { margin-top: 12px; }
 
@@ -1172,7 +1184,7 @@
         </div>
         <div class="card">
           <p class="hint" style="margin:0 0 12px;line-height:1.55;">
-            Select a provider, paste its key and enter a model, then click <strong>Save &amp; Start</strong>.
+            Select a provider, add its API key or connect an account, and choose a model. Then click <strong>Save &amp; Start</strong>.
             You can add multiple providers — each saves alongside the others.
             Configured providers appear in the list below with a Remove button.
             Every provider Hermes supports is also manageable from the
@@ -1266,9 +1278,9 @@
             </div>
           </template>
 
-          <div class="field-gap" x-show="selectedProvider">
+          <div class="field-gap" x-show="selectedProvider && providerMap[selectedProvider]?.isOauth !== 'codex'">
             <label class="field-label">LLM Model</label>
-            <input type="text" :value="vars.LLM_MODEL||''" @input="vars.LLM_MODEL=$event.target.value"
+            <input type="text" :value="vars.LLM_MODEL||''" @input="vars.LLM_MODEL=$event.target.value; modelIntent=true"
                    :placeholder="providerMap[selectedProvider]?.modelPlaceholder || (selectedProvider === 'xAI Grok (SuperGrok)' || selectedProvider === 'xAI' ? 'e.g. grok-4.3'
                      : selectedProvider === 'Anthropic (Claude)' ? 'e.g. claude-sonnet-4-20250514'
                      : selectedProvider === 'AWS Bedrock' ? 'e.g. anthropic.claude-3-5-sonnet-20241022-v2:0'
@@ -1277,12 +1289,63 @@
                      : selectedProvider === 'Custom Endpoint' || selectedProvider === 'Azure Foundry' ? 'model-id as required by the endpoint'
                      : 'e.g. openai/gpt-4o-mini  or  deepseek/deepseek-chat')">
             <p class="hint" x-show="providerMap[selectedProvider]?.modelHint" x-text="providerMap[selectedProvider]?.modelHint"></p>
+            <div class="codex-actions" x-show="hasSavedAssignment && vars.LLM_MODEL">
+              <button type="button" class="btn" @click="modelIntent=true" :disabled="modelIntent || saving"
+                      x-text="modelIntent ? 'Model will be used' : 'Use this model'"></button>
+            </div>
+            <p class="hint" x-show="hasSavedAssignment && !modelIntent">Saving now updates only this provider's credentials and keeps the model Hermes is using. Edit the model or click <strong>Use this model</strong> to switch to it.</p>
             <p class="hint" x-show="selectedProvider === 'xAI Grok (SuperGrok)' || selectedProvider === 'xAI'">e.g. <code>grok-4.3</code>, <code>grok-4.20-0309-reasoning</code></p>
             <p class="hint" x-show="selectedProvider === 'Anthropic (Claude)'">e.g. <code>claude-sonnet-4-20250514</code>, <code>claude-opus-4-20250115</code></p>
             <p class="hint" x-show="selectedProvider === 'AWS Bedrock'">e.g. <code>anthropic.claude-3-5-sonnet-20241022-v2:0</code>, <code>us.meta.llama3-2-90b-instruct-v1:0</code></p>
             <p class="hint" x-show="selectedProvider === 'Fireworks AI'">Format: <code>accounts/fireworks/models/&lt;model-id&gt;</code></p>
             <p class="hint" x-show="selectedProvider === 'MiniMax' || selectedProvider === 'MiniMax (China)'">e.g. <code>MiniMax-M3</code>, <code>MiniMax-M2.7</code></p>
             <p class="hint" x-show="!['xAI Grok (SuperGrok)','xAI','Anthropic (Claude)','AWS Bedrock','Fireworks AI','Atlas Cloud','MiniMax','MiniMax (China)','Custom Endpoint','Azure Foundry','9Router','OmniRoute'].includes(selectedProvider) && selectedProvider">Check your provider's docs for model names. OpenRouter format: <code>provider/model-name</code></p>
+          </div>
+        </div>
+
+        <div class="card codex-setup" x-show="selectedProvider === 'ChatGPT (OAuth)' || codex.status === 'waiting'" x-cloak>
+          <h3>ChatGPT connection</h3>
+          <p class="hint">Sign in on OpenAI’s verification page to authorize this deployment. Hermes manages your connection; no OpenAI API key is needed. For named profiles, use Hermes Dashboard &rarr; Keys.</p>
+          <div aria-live="polite">
+            <p class="hint" x-show="codex.busy">Working…</p>
+            <p class="hint" x-show="codex.connected && codex.status !== 'waiting'">Connected. Choose a model and confirm it below.</p>
+            <template x-if="codex.status === 'waiting'">
+              <div>
+                <p class="hint">Open the verification page, enter this code, and return here. Authorization is checked automatically.</p>
+                <label class="field-label" for="codex-device-code">One-time code</label>
+                <input id="codex-device-code" type="text" readonly :value="codex.user_code" style="font-family:var(--font-mono);font-size:20px;">
+                <div class="codex-actions">
+                  <a class="btn primary" :href="codex.verification_url" target="_blank" rel="noopener noreferrer">Open verification page</a>
+                  <button class="btn" @click="copyCodexCode()">Copy code</button>
+                  <button class="btn" @click="cancelCodex()" :disabled="codex.busy">Cancel authorization</button>
+                </div>
+                <p class="hint" x-show="codex.expires_at">Waiting for approval · code expires <span x-text="codex.expires_at ? new Date(codex.expires_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : ''"></span></p>
+              </div>
+            </template>
+          </div>
+          <p class="hint warn" x-show="codex.error" x-text="codex.error" role="alert"></p>
+          <div class="codex-actions" x-show="codex.status !== 'waiting'">
+            <button class="btn primary" @click="startCodex()" :disabled="codex.busy || saving || configNeedsLoad" x-text="codex.connected ? 'Reconnect ChatGPT' : 'Connect ChatGPT'"></button>
+            <button class="btn danger" x-show="codex.connected" @click="disconnectCodex()" :disabled="codex.busy || saving">Disconnect</button>
+          </div>
+          <div class="codex-model" x-show="codex.connected && selectedProvider === 'ChatGPT (OAuth)' && codex.status !== 'waiting'">
+            <label class="field-label" for="codex-model">ChatGPT model</label>
+            <div class="codex-model-row">
+            <select id="codex-model" x-model="vars.LLM_MODEL" @change="modelIntent = true" :disabled="codex.modelsLoading || codex.busy || saving">
+              <option value="" x-text="codex.modelsLoading ? 'Loading models…' : '— Select model —'"></option>
+              <template x-if="vars.LLM_MODEL && !codex.models.includes(vars.LLM_MODEL)">
+                <option :value="vars.LLM_MODEL" x-text="vars.LLM_MODEL + ' (saved; not in current list)'" disabled></option>
+              </template>
+              <template x-for="model in codex.models" :key="model"><option :value="model" x-text="model"></option></template>
+            </select>
+            <button class="btn primary" @click="confirmCodexModel()"
+                    :disabled="codex.busy || saving || codex.modelsLoading || !codex.models.includes(vars.LLM_MODEL) || (codex.confirmedModel === vars.LLM_MODEL && modelProvider === 'openai-codex')"
+                    x-text="codex.confirmedModel === vars.LLM_MODEL && modelProvider === 'openai-codex' ? 'Model confirmed' : 'Confirm model'"></button>
+            </div>
+            <p class="hint codex-ready" role="status" x-show="codex.confirmedModel && codex.confirmedModel === vars.LLM_MODEL && modelProvider === 'openai-codex'">ChatGPT is ready. Click <strong>Save &amp; Start</strong> below to apply your settings and start Hermes.</p>
+            <p class="hint">Model choices come from Hermes. Access and usage limits depend on your OpenAI account.</p>
+            <p class="hint warn" x-show="codex.modelsError" x-text="codex.modelsError" role="alert"></p>
+            <div class="codex-actions"><button class="btn" @click="loadCodexModels()" :disabled="codex.modelsLoading">Reload model list</button></div>
           </div>
         </div>
 
@@ -1873,8 +1936,9 @@
         <div class="guide-section">
           <div class="guide-section-title">
             <span class="guide-num">1</span>
-            Get a Free LLM API Key
+            Choose an LLM Provider
           </div>
+          <p class="hint">For ChatGPT, choose <strong>ChatGPT (OAuth)</strong> on Setup, connect with the displayed one-time code, choose a model and save. For a free API-key option, follow the OpenRouter steps below.</p>
           <ol class="step-list">
             <li>
               Go to <a href="https://openrouter.ai" target="_blank" rel="noopener">openrouter.ai</a> and create a free account.
@@ -1961,6 +2025,23 @@
             template-only fixes and improvements on top of it — the Hermes version never changes within a series.
             <strong style="color:var(--text);">Pick the highest number</strong> for the Hermes version you want; each branch stays put once published.
           </div>
+        </div>
+
+        <div class="changelog-entry minor">
+          <div class="changelog-date">October 19, 2026</div>
+          <div class="changelog-meta">
+            <span class="meta-box"><span class="meta-label">Git branch</span><code>release/v0.22.2/2</code></span>
+            <span class="meta-box version"><span class="meta-label">Hermes compatible version</span><code>v0.22.2</code></span>
+          </div>
+          <div class="changelog-group">Improvements</div>
+          <ul class="changelog-list">
+            <li>Connect ChatGPT from Setup with a one-time code, confirm a Hermes-listed model before starting, and reconnect or disconnect your account.</li>
+          </ul>
+          <div class="changelog-group">Bug fixes</div>
+          <ul class="changelog-list">
+            <li>Dashboard-selected models and endpoint settings survive gateway restarts and unrelated setup saves; outdated setup forms are rejected before they can overwrite newer settings.</li>
+            <li>Changing or removing a SuperGrok connection preserves other saved OAuth accounts during token refresh.</li>
+          </ul>
         </div>
 
         <div class="changelog-entry major">
@@ -2428,6 +2509,18 @@ function app() {
     // True only when the SERVER has a persisted complete config.
     // Distinct from isSetupDone, which tracks the in-memory form.
     savedConfigComplete: false,
+    // True when the server has a saved native model + provider pair
+    // (model_config from config.yaml, never the .env LLM_MODEL fallback). This is
+    // independent of readiness: an expired authorization leaves the pair in
+    // place while config_complete is false. Defaults to true so that nothing
+    // is implicitly assigned before the server state has been loaded.
+    hasSavedAssignment: true,
+    configRevision: '',
+    modelProvider: '',
+    // True only after the user deliberately picked/edited/confirmed a model.
+    // Provider selection and auto-filled hints never set it, so a credential
+    // edit cannot re-assign the model/provider pair chosen natively in Hermes.
+    modelIntent: false,
     configNeedsLoad: true,
     // Hermes release this image pins, reported by the server (HERMES_REF).
     // Never hardcoded here — it must stay correct when a deployment is pinned
@@ -2437,6 +2530,7 @@ function app() {
     tools,
 
     providerMap: {
+      'ChatGPT (OAuth)':      { key: null, modelKey: '_MODEL_OPENAI_CODEX', isOauth: 'codex' },
       // keyPrefix mirrors hermes' KNOWN_PROVIDER_KEY_PREFIXES (hermes_cli/auth.py,
       // new in v2026.8.27). Hermes SKIPS a key that fails the prefix and only logs
       // a warning, so without this the bot just never answers. Re-check on a bump —
@@ -2496,6 +2590,7 @@ function app() {
     },
 
     xai: { loading: false, userCode: '', verificationUri: '', status: 'none', error: '' },
+    codex: { connected: false, status: 'not_connected', busy: false, error: '', models: [], confirmedModel: '', modelsLoading: false, modelsError: '', timer: null, sequence: 0 },
 
     selectedProvider: '',
 
@@ -2511,7 +2606,9 @@ function app() {
     get configuredProviders() {
       const list = [];
       for (const [name, p] of Object.entries(this.providerMap)) {
-        if (p.isOauth === 'xai') {
+        if (p.isOauth === 'codex') {
+          if (this.codex.connected) list.push({ providerKey: name, name, model: this.codex.confirmedModel || this.vars._MODEL_OPENAI_CODEX || '', isOauth: true });
+        } else if (p.isOauth === 'xai') {
           if (this.xai.status === 'authorized') {
             list.push({ providerKey: name, name, model: this.vars['_MODEL_XAI_OAUTH'] || '', isOauth: true });
           }
@@ -2530,7 +2627,7 @@ function app() {
     },
 
     get isSetupDone() {
-      return this.configuredProviders.length > 0 && !!this.vars.LLM_MODEL;
+      return this.savedConfigComplete || (this.configuredProviders.length > 0 && !!this.vars.LLM_MODEL);
     },
 
     // True once a typed key provably can't work: hermes drops a key failing the
@@ -2545,11 +2642,19 @@ function app() {
     onProviderChange() {
       const p = this.providerMap[this.selectedProvider];
       if (!p) return;
+      // Whatever the field held is replaced by a hint below; a hint is not a choice.
+      this.modelIntent = false;
       // Load the per-provider stored model so the model field pre-fills.
       const storedModel = p.modelKey ? this.vars[p.modelKey] : null;
       if (storedModel) this.vars.LLM_MODEL = storedModel;
+      else if (p.isOauth === 'codex') this.vars.LLM_MODEL = '';
       else if (p.defaultModel) this.vars.LLM_MODEL = p.defaultModel;
       else if (p.isRouter) this.vars.LLM_MODEL = '';
+      else if (this.modelProvider === 'openai-codex') this.vars.LLM_MODEL = '';
+      if (p.isOauth === 'codex') {
+        this.loadCodexStatus();
+        if (this.codex.connected) this.loadCodexModels();
+      }
       // Reset xAI flow state if switching away (unless already fully authorized).
       if (p.isOauth !== 'xai' && this.xai.status !== 'authorized') {
         this.xai.status = 'none';
@@ -2562,6 +2667,7 @@ function app() {
     async removeProvider(providerKey) {
       const p = this.providerMap[providerKey];
       if (!p) return;
+      if (p.isOauth === 'codex') { await this.disconnectCodex(); return; }
       if (!confirm(`Remove ${providerKey} provider?`)) return;
       if (p.isOauth === 'xai') {
         await fetch('/setup/api/oauth/xai', { method: 'DELETE' });
@@ -2585,12 +2691,13 @@ function app() {
       }
       if (this.selectedProvider === providerKey) this.selectedProvider = '';
       try {
-        await fetch('/setup/api/config', {
+        const r = await fetch('/setup/api/config', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ vars: { ...this.vars }, _restart: true }),
+          body: JSON.stringify({ vars: { ...this.vars }, _restart: true, _model_assignment: false, _config_revision: this.configRevision }),
         });
-      } catch {}
+        if (!r.ok) { const d = await r.json().catch(() => ({})); this.notify(d.error || 'Provider removal failed', false); return; }
+      } catch { this.notify('Provider removal failed. Check your connection and retry.', false); return; }
       await this.loadConfig();
       this.notify(`${providerKey} removed`, true);
     },
@@ -2611,6 +2718,151 @@ function app() {
     clearTool(t) {
       this.vars[t.key] = '';
       if (t.key === 'BROWSERBASE_API_KEY') this.vars.BROWSERBASE_PROJECT_ID = '';
+    },
+
+    async codexRequest(path = '', options = {}) {
+      const r = await fetch('/setup/api/oauth/codex' + path, options);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const error = new Error(d.error || 'ChatGPT request failed. Retry the request.');
+        error.status = r.status;
+        throw error;
+      }
+      return d;
+    },
+
+    scheduleCodexPoll() {
+      clearTimeout(this.codex.timer);
+      if (this.codex.status === 'waiting') {
+        this.codex.timer = setTimeout(() => this.loadCodexStatus(), Math.max(3000, (this.codex.poll_interval || 5) * 1000));
+      }
+    },
+
+    async loadCodexStatus() {
+      if (this.codex.busy) return;
+      const sequence = this.codex.sequence;
+      try {
+        const d = await this.codexRequest();
+        if (sequence !== this.codex.sequence) return;
+        this.codex.connected = !!d.connected;
+        this.codex.status = d.status;
+        this.codex.error = d.error || '';
+        if (d.status === 'waiting' && !this.selectedProvider) {
+          this.selectedProvider = 'ChatGPT (OAuth)';
+          this.vars.LLM_MODEL = this.vars._MODEL_OPENAI_CODEX || '';
+        }
+        for (const key of ['user_code', 'verification_url', 'expires_at', 'poll_interval']) this.codex[key] = d[key] || '';
+        if (d.status === 'connected' && this.selectedProvider === 'ChatGPT (OAuth)' && !this.codex.models.length && !this.codex.modelsLoading) {
+          await this.loadCodexModels();
+        }
+      } catch (e) {
+        if (sequence !== this.codex.sequence) return;
+        this.codex.error = e.status === 401 ? 'Your admin session expired. Sign in again to check authorization.' : e.message;
+        if (e.status === 401) { clearTimeout(this.codex.timer); return; }
+      }
+      this.scheduleCodexPoll();
+    },
+
+    async startCodex() {
+      if (this.codex.busy) return;
+      clearTimeout(this.codex.timer);
+      ++this.codex.sequence;
+      this.codex.busy = true;
+      this.codex.error = '';
+      this.codex.models = [];
+      try {
+        const d = await this.codexRequest('/start', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({_config_revision: this.configRevision}),
+        });
+        if (d.previous_revision === this.configRevision) this.configRevision = d.config_revision;
+        this.codex.status = d.status;
+        for (const key of ['user_code', 'verification_url', 'expires_at', 'poll_interval']) this.codex[key] = d[key] || '';
+      } catch (e) { this.codex.error = e.message; }
+      finally { this.codex.busy = false; }
+      this.scheduleCodexPoll();
+    },
+
+    async cancelCodex() {
+      if (this.codex.busy) return;
+      ++this.codex.sequence;
+      clearTimeout(this.codex.timer);
+      this.codex.busy = true;
+      try {
+        await this.codexRequest('/cancel', {method: 'POST'});
+        this.codex.status = 'not_connected';
+        this.codex.error = '';
+      } catch (e) {
+        this.codex.error = e.message;
+        this.notify('Cancellation was not confirmed. ' + e.message, false);
+        this.scheduleCodexPoll();
+        return;
+      }
+      finally { this.codex.busy = false; }
+      await this.loadCodexStatus();
+      this.notify(this.codex.connected ? 'Request closed. ChatGPT is connected; use Disconnect to remove saved authorization.' : 'Authorization request closed', true);
+    },
+
+    async disconnectCodex() {
+      if (this.codex.busy || !confirm('Disconnect all saved ChatGPT/Codex accounts for the default profile? Hermes will pause while credentials are removed. Named profiles using these credentials will need to reconnect. Chats, files and other API keys are kept.')) return;
+      ++this.codex.sequence;
+      clearTimeout(this.codex.timer);
+      this.codex.busy = true;
+      this.codex.error = '';
+      try {
+        await this.codexRequest('', {method: 'DELETE'});
+        this.codex.connected = false;
+        this.codex.status = 'not_connected';
+        this.codex.models = [];
+        if (this.selectedProvider === 'ChatGPT (OAuth)') this.selectedProvider = '';
+        await this.loadConfig();
+        await this.loadStatus();
+        this.notify('ChatGPT disconnected', true);
+      } catch (e) { this.codex.error = e.message; this.notify(e.message, false); }
+      finally { this.codex.busy = false; }
+    },
+
+    async confirmCodexModel() {
+      const model = this.vars.LLM_MODEL;
+      if (this.codex.busy || !this.codex.connected || !this.codex.models.includes(model)) return;
+      this.codex.busy = true;
+      this.codex.error = '';
+      try {
+        const r = await fetch('/setup/api/config', {
+          method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({vars: {LLM_MODEL: model}, _active_oauth_provider: 'openai-codex', _restart: false, _config_revision: this.configRevision}),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || d.ok !== true) throw new Error(d.error || 'Could not confirm the model. Retry before starting Hermes.');
+        this.configRevision = d.config_revision;
+        this.savedConfigComplete = !!d.config_complete;
+        this.modelProvider = 'openai-codex';
+        this.hasSavedAssignment = true;
+        this.codex.confirmedModel = model;
+        this.modelIntent = true;
+        this.vars._MODEL_OPENAI_CODEX = model;
+        this.notify('ChatGPT model confirmed. Use Save & Start when ready.', true);
+      } catch (e) { this.codex.error = e.message; this.notify(e.message, false); }
+      finally { this.codex.busy = false; }
+    },
+
+    async loadCodexModels() {
+      if (this.codex.modelsLoading) return;
+      const sequence = this.codex.sequence;
+      this.codex.modelsLoading = true;
+      this.codex.modelsError = '';
+      try {
+        const d = await this.codexRequest('/models');
+        if (sequence !== this.codex.sequence) return;
+        this.codex.models = d.models || [];
+        if (!this.codex.models.length) this.codex.modelsError = 'Hermes returned no models. Reload the list or check your connection in Hermes Dashboard → Keys.';
+      } catch (e) { if (sequence === this.codex.sequence) this.codex.modelsError = e.message; }
+      finally { this.codex.modelsLoading = false; }
+    },
+
+    async copyCodexCode() {
+      try { await navigator.clipboard.writeText(this.codex.user_code || ''); this.notify('Code copied', true); }
+      catch { this.notify('Select the code and copy it manually.', false); }
     },
 
     async startXaiOauth() {
@@ -2666,10 +2918,18 @@ function app() {
         if (r.ok) {
           const d = await r.json();
           this.vars = d.vars || {};
+          this.configRevision = d.config_revision;
+          this.modelProvider = d.model_config?.provider || '';
+          // Captured from the server response before any draft/autofill edits.
+          this.hasSavedAssignment = !!(d.model_config?.model && d.model_config?.provider);
+          this.codex.confirmedModel = this.modelProvider === 'openai-codex' ? d.model_config.model : '';
+          if (d.model_config?.model) this.vars.LLM_MODEL = d.model_config.model;
+          if (d.model_config?.provider === 'openai-codex') this.vars._MODEL_OPENAI_CODEX = d.model_config.model;
           this.configNeedsLoad = false;
           // Refresh xAI OAuth status (drives configuredProviders computed getter).
           const xs = await fetch('/setup/api/oauth/xai/status').then(r2 => r2.json()).catch(() => ({ status: 'none' }));
           this.xai.status = xs.status;
+          await this.loadCodexStatus();
           // Detect active channels
           this.channelsEnabled = {
             telegram:   !!(this.vars.TELEGRAM_BOT_TOKEN),
@@ -2685,7 +2945,7 @@ function app() {
             this.toolsEnabled[t.key] = !!(this.vars[t.key]);
           }
           // savedConfigComplete: server has at least one provider + model.
-          this.savedConfigComplete = !!(this.vars.LLM_MODEL && this.configuredProviders.length > 0);
+          this.savedConfigComplete = !!d.config_complete;
         }
       } catch {}
     },
@@ -2694,7 +2954,23 @@ function app() {
       this.saving = true;
       // Sync per-provider model key so the configured list shows the right model.
       const p = this.selectedProvider ? this.providerMap[this.selectedProvider] : null;
-      if (p && this.vars.LLM_MODEL) {
+      if (p?.isOauth === 'codex' && (this.codex.busy || this.codex.status !== 'connected' || !this.codex.models.includes(this.vars.LLM_MODEL))) {
+        this.notify('Complete ChatGPT authorization and choose a listed model before saving.', false);
+        this.saving = false;
+        return;
+      }
+      // Assign the model/provider only on a deliberate pick, or on first setup
+      // when there is no saved pair to overwrite (absence of a saved assignment,
+      // not config readiness: an existing pair with expired auth is still a pair). Otherwise this is a credential
+      // edit and the server keeps the saved pair even though vars.LLM_MODEL is
+      // always populated with a hint.
+      const assignModel = !!p && (this.modelIntent || !this.hasSavedAssignment);
+      if (p?.isOauth === 'codex' && !assignModel && this.modelProvider !== 'openai-codex') {
+        this.notify('Confirm the ChatGPT model before saving.', false);
+        this.saving = false;
+        return;
+      }
+      if (assignModel && this.vars.LLM_MODEL) {
         if (p.modelKey) this.vars[p.modelKey] = this.vars.LLM_MODEL;
       }
       try {
@@ -2711,12 +2987,18 @@ function app() {
             // soon as a second provider key exists. Empty when the user
             // saved without touching a provider (e.g. just a channel toggle).
             _active_provider_key: (p && p.key) ? p.key : '',
+            _active_oauth_provider: assignModel && p?.isOauth === 'codex' ? 'openai-codex' : '',
+            // Boolean intent: true = the user deliberately assigned this model to
+            // this provider; false = credentials/other settings only.
+            _model_assignment: assignModel,
+            _config_revision: this.configRevision,
           }),
         });
         if (r.ok) {
           const d = await r.json().catch(() => ({}));
           this.notify(d && d.warning ? `Saved, but: ${d.warning}` : 'Saved', !(d && d.warning));
           this.selectedProvider = '';
+          this.modelIntent = false;
           await this.loadConfig();
         } else { const e = await r.json().catch(()=>{}); this.notify(e?.error||'Save failed', false); }
       } catch(e) { this.notify('Save failed: '+e.message, false); }

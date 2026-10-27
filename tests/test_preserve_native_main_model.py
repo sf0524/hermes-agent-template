@@ -65,14 +65,21 @@ class PreserveNativeMainModelTests(ConfigSafetyFixture, unittest.IsolatedAsyncio
         self.server.write_config_yaml({"LLM_MODEL": "seed-model"}, preserve_model=True)
         self.assertEqual(self._config()["model"]["default"], "seed-model")
 
-    async def test_preserve_keeps_custom_endpoint_but_strips_stale_builtin_endpoint(self):
+    async def test_preserve_keeps_complete_native_mapping_but_explicit_write_strips_stale_builtin_endpoint(self):
+        # Hermes writes routing fields even for built-ins (e.g. Codex base_url/api_mode),
+        # so a preserved native model keeps its whole mapping across restarts...
         self._write_config({"model": {"default": "m", "provider": "custom", "base_url": "http://x/v1"}})
         self.server.write_config_yaml({"LLM_MODEL": "env"}, preserve_model=True)
         self.assertEqual(self._config()["model"]["base_url"], "http://x/v1")
-        self._write_config({"model": {"default": "m", "provider": "openrouter", "base_url": "http://stale"}})
+        self._write_config({"model": {"default": "m", "provider": "openrouter", "base_url": "http://native"}})
         self.server.write_config_yaml({"LLM_MODEL": "env"}, preserve_model=True)
-        self.assertNotIn("base_url", self._config()["model"])
+        self.assertEqual(self._config()["model"]["base_url"], "http://native")
         self.assertEqual(self._config()["model"]["default"], "m")
+        # ...while an explicit (non-preserving) write still clears stale built-in routing.
+        self._write_config({"model": {"default": "m", "provider": "openrouter", "base_url": "http://stale"}})
+        self.server.write_config_yaml({"LLM_MODEL": "env"})
+        self.assertNotIn("base_url", self._config()["model"])
+        self.assertEqual(self._config()["model"]["default"], "env")
 
     async def test_admin_save_without_model_change_preserves_native_model(self):
         self.server.guard = lambda _: None
@@ -135,6 +142,115 @@ class PreserveNativeMainModelTests(ConfigSafetyFixture, unittest.IsolatedAsyncio
         self.assertEqual(calls, [])
         model = self._config()["model"]
         self.assertEqual((model["provider"], model["default"]), ("openai-codex", "gpt-6.1-sol"))
+
+    async def test_key_only_save_keeps_complete_native_codex_mapping_and_never_pins(self):
+        self.server.guard = lambda _: None
+        self._write_env("OPENROUTER_API_KEY=k\nGEMINI_API_KEY=g\nLLM_MODEL=stale-env-model\n")
+        native = {"default": "gpt-6.1-sol", "provider": "openai-codex",
+                  "base_url": "https://chatgpt.com/backend-api/codex", "api_mode": "codex_responses"}
+        self._write_config({"model": dict(native)})
+        calls, pin = self._fake_native_pin()
+        for submitted in ({"OPENROUTER_API_KEY": "k"}, {"OPENROUTER_API_KEY": "k", "LLM_MODEL": ""}):
+            with self.subTest(submitted=submitted), patch.object(self.server, "set_active_model_via_hermes", pin):
+                resp = await self.server.api_config_put(_Request({
+                    "vars": submitted, "_active_provider_key": "OPENROUTER_API_KEY", "_restart": False}))
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(self._config()["model"], native)
+        self.assertEqual(calls, [])
+
+    async def test_ui_shaped_key_only_save_with_stale_populated_model_preserves_complete_pair(self):
+        # saveConfig() always sends a populated LLM_MODEL (a stale per-provider
+        # hint) plus _active_provider_key; the explicit false must win.
+        self.server.guard = lambda _: None
+        self._write_env("GEMINI_API_KEY=old\nLLM_MODEL=gemini-old-hint\n_MODEL_GEMINI_API_KEY=gemini-old-hint\n")
+        native = {"default": "gemini-newer-native", "provider": "gemini",
+                  "base_url": "https://example.invalid/native", "api_mode": "chat_completions"}
+        self._write_config({"model": dict(native)})
+        calls, pin = self._fake_native_pin()
+        with patch.object(self.server, "set_active_model_via_hermes", pin):
+            resp = await self.server.api_config_put(_Request({
+                "vars": {"GEMINI_API_KEY": "new-key", "LLM_MODEL": "gemini-old-hint",
+                         "_MODEL_GEMINI_API_KEY": "gemini-old-hint"},
+                "_active_provider_key": "GEMINI_API_KEY", "_active_oauth_provider": "",
+                "_model_assignment": False, "_restart": False}))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(calls, [])
+        self.assertEqual(self._config()["model"], native)
+        self.assertEqual(self.server.read_env(self.server.ENV_FILE)["GEMINI_API_KEY"], "new-key")
+
+    async def test_explicit_false_beats_a_differing_stale_model_without_provider_key(self):
+        self.server.guard = lambda _: None
+        self._write_env("OPENROUTER_API_KEY=k\nLLM_MODEL=env-model\n")
+        native = {"default": "native-choice", "provider": "openai-codex"}
+        self._write_config({"model": dict(native)})
+        resp = await self.server.api_config_put(_Request({
+            "vars": {"OPENROUTER_API_KEY": "k", "LLM_MODEL": "something-else"},
+            "_model_assignment": False, "_restart": False}))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._config()["model"], native)
+
+    async def test_explicit_true_same_value_and_provider_switch_pin_the_pair(self):
+        self.server.guard = lambda _: None
+        for env_model, submitted, key, provider in (
+            ("same-model", "same-model", "OPENROUTER_API_KEY", "openrouter"),  # same-value confirmation
+            ("old-env", "other-provider-model", "GEMINI_API_KEY", "gemini"),   # provider switch
+        ):
+            with self.subTest(provider=provider):
+                self._write_env(f"OPENROUTER_API_KEY=k\nGEMINI_API_KEY=g\nLLM_MODEL={env_model}\n")
+                self._write_config({"model": {"default": "native-choice", "provider": "openai-codex"}})
+                calls, pin = self._fake_native_pin()
+                with patch.object(self.server, "set_active_model_via_hermes", pin):
+                    resp = await self.server.api_config_put(_Request({
+                        "vars": {key: "k", "LLM_MODEL": submitted},
+                        "_active_provider_key": key, "_model_assignment": True, "_restart": False}))
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(calls, [(self.server.HERMES_PROVIDER_IDS[key], submitted)])
+                model = self._config()["model"]
+                self.assertEqual((model["provider"], model["default"]), (self.server.HERMES_PROVIDER_IDS[key], submitted))
+
+    async def test_model_assignment_must_be_boolean_and_cannot_contradict_oauth(self):
+        self.server.guard = lambda _: None
+        self._write_config({"model": {"default": "native-choice", "provider": "openrouter"}})
+        for bad in ("false", 0, 1, "", [], None):
+            with self.subTest(bad=bad):
+                resp = await self.server.api_config_put(_Request({
+                    "vars": {"LLM_MODEL": "m"}, "_model_assignment": bad, "_restart": False}))
+                self.assertEqual(resp.status_code, 400)
+        resp = await self.server.api_config_put(_Request({
+            "vars": {"LLM_MODEL": "m"}, "_active_oauth_provider": "openai-codex",
+            "_model_assignment": False, "_restart": False}))
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self._config()["model"]["default"], "native-choice")
+
+    async def test_explicit_null_model_assignment_is_rejected_before_any_side_effect(self):
+        # null is a supplied non-Boolean, not an absent flag: it must not fall
+        # back to legacy inference (which would pin the stale populated model).
+        self.server.guard = lambda _: None
+        env_text = "GEMINI_API_KEY=old\nLLM_MODEL=gemini-old-hint\n"
+        self._write_env(env_text)
+        self._write_config({"model": {"default": "gemini-newer-native", "provider": "gemini"}})
+        config_before = (self.home / "config.yaml").read_bytes()
+        calls, pin = self._fake_native_pin()
+        with patch.object(self.server, "set_active_model_via_hermes", pin):
+            resp = await self.server.api_config_put(_Request({
+                "vars": {"GEMINI_API_KEY": "new-key", "LLM_MODEL": "gemini-old-hint"},
+                "_active_provider_key": "GEMINI_API_KEY", "_model_assignment": None, "_restart": False}))
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(calls, [])
+        self.assertEqual((self.home / ".env").read_text(encoding="utf-8"), env_text)
+        self.assertEqual((self.home / "config.yaml").read_bytes(), config_before)
+
+    async def test_absent_model_assignment_keeps_legacy_inference(self):
+        self.server.guard = lambda _: None
+        self._write_env("GEMINI_API_KEY=old\nLLM_MODEL=old-env\n")
+        self._write_config({"model": {"default": "native-choice", "provider": "openai-codex"}})
+        calls, pin = self._fake_native_pin()
+        with patch.object(self.server, "set_active_model_via_hermes", pin):
+            resp = await self.server.api_config_put(_Request({
+                "vars": {"GEMINI_API_KEY": "g", "LLM_MODEL": "legacy-pick"},
+                "_active_provider_key": "GEMINI_API_KEY", "_restart": False}))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(calls, [(self.server.HERMES_PROVIDER_IDS["GEMINI_API_KEY"], "legacy-pick")])
 
     async def test_admin_explicit_model_change_updates_yaml(self):
         self.server.guard = lambda _: None

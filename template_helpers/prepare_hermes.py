@@ -27,7 +27,10 @@ def emit(phase: str, message: str, **fields: object) -> None:
 
 def seed_home(home: Path, project: Path) -> None:
     """Seed missing files after journal recovery, without following links."""
-    from migrate_hermes_configs import _file_exists_without_following_links, _read_regular
+    if __package__:
+        from .migrate_hermes_configs import _file_exists_without_following_links, _read_regular
+    else:  # The supervised worker runs directly with the image-owned interpreter.
+        from migrate_hermes_configs import _file_exists_without_following_links, _read_regular
 
     for path in (home / "config.yaml", home / ".env"):
         if _file_exists_without_following_links(path):
@@ -148,9 +151,14 @@ def prepare(mode: str) -> None:
         recover_publication(project)
 
     seed_home(home, project)
-    from migrate_hermes_configs import (
-        config_homes, migrate, profile_environment, validate_profile_execution_environment,
-    )
+    if __package__:
+        from .migrate_hermes_configs import (
+            config_homes, migrate, profile_environment, validate_profile_execution_environment,
+        )
+    else:
+        from migrate_hermes_configs import (
+            config_homes, migrate, profile_environment, validate_profile_execution_environment,
+        )
     # Validate the complete volume before PM reads profile selections or a
     # subprocess loads any target home's secrets.
     homes = config_homes(home)

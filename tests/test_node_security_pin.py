@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from build_hermes_image import NODE_SHA256, NODE_VERSION, pin_security_node
+from template_helpers.build_hermes_image import NODE_SHA256, NODE_VERSION, pin_security_node
 
 
 class NodeSecurityPinTests(unittest.TestCase):

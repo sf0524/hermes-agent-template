@@ -77,17 +77,17 @@ RUN git clone --depth 1 --branch "${HERMES_REF}" \
             d923a5eb487a17c0a68801bba9ef0f56c81040a8; \
     fi
 WORKDIR /opt/hermes/repo
-COPY build_hermes_image.py /app/build_hermes_image.py
+COPY template_helpers/build_hermes_image.py /app/template_helpers/build_hermes_image.py
 COPY requirements.txt /app/requirements.txt
-RUN python3 /app/build_hermes_image.py tools
+RUN python3 /app/template_helpers/build_hermes_image.py tools
 
 # Freeze the declared release graph and its exact baked-extra baseline. No raw
 # pip/uv mutations follow it. The retired honcho extra belongs to its plugin.
-RUN python3 /app/build_hermes_image.py dependencies
+RUN python3 /app/template_helpers/build_hermes_image.py dependencies
 ENV HERMES_PYTHON=/opt/hermes/venv/bin/python
-RUN python3 /app/build_hermes_image.py frontends && \
-    python3 /app/build_hermes_image.py assemble && \
-    python3 /app/build_hermes_image.py verify && \
+RUN python3 /app/template_helpers/build_hermes_image.py frontends && \
+    python3 /app/template_helpers/build_hermes_image.py assemble && \
+    python3 /app/template_helpers/build_hermes_image.py verify && \
     rm -rf /root/.cache /root/.hermes /root/.npm
 
 # The admin server uses only the image-owned wrapper/base environment. PM may
@@ -98,9 +98,7 @@ ENV PATH="/opt/hermes/bin:/opt/hermes/wrapper-venv/bin:${PATH}" \
     HERMES_TUI_DIR=/opt/hermes/ui-tui
 RUN mkdir -p /data/.hermes
 COPY server.py /app/server.py
-COPY migrate_hermes_configs.py /app/migrate_hermes_configs.py
-COPY prepare_hermes.py /app/prepare_hermes.py
-COPY check_pending_deliveries.py /app/check_pending_deliveries.py
+COPY template_helpers/ /app/template_helpers/
 COPY templates/ /app/templates/
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh

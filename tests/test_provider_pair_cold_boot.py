@@ -12,7 +12,9 @@ rewrites the fixture config so a replayed pin is observable.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -33,16 +35,12 @@ ConfigSafetyFixture = _module.ConfigSafetyFixture
 
 
 def _load(name: str):
-    path = ROOT / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(f"_cold_boot_{name}", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module  # dataclasses resolve their module by name
+    # Import as a package member so helpers' relative imports resolve at call time.
     sys.path.insert(0, str(ROOT))
     try:
-        spec.loader.exec_module(module)
+        return importlib.import_module(f"template_helpers.{name}")
     finally:
         sys.path.remove(str(ROOT))
-    return module
 
 
 class _Request:
@@ -150,6 +148,13 @@ class ProviderPairColdBootTests(ConfigSafetyFixture, unittest.IsolatedAsyncioTes
                 )
                 self._write_env(OPENROUTER_API_KEY="dummy-or", GEMINI_API_KEY="dummy-gem",
                                 LLM_MODEL="stale-env-model")
+                auth = self.home / "auth.json"
+                auth.unlink(missing_ok=True)
+                if provider == "openai-codex":
+                    # Native ChatGPT OAuth providers only start with stored grants.
+                    auth.write_text(json.dumps({"credential_pool": {"openai-codex": [
+                        {"access_token": "dummy-access", "refresh_token": "dummy-refresh"}]}}),
+                        encoding="utf-8")
 
                 migrated = self._seed_and_migrate()
                 self.assertEqual(self._pair(), want, "after seed_home + migrate")
