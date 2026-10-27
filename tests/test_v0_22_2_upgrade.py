@@ -136,8 +136,9 @@ class UpgradeTests(ConfigSafetyFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(list(self.server.BACKUP_DIR.glob("pre-restore-*.zip"))), 1)
 
     async def test_real_preparation_timeout_stops_owned_child(self):
-        helper = self.home / "prepare_hermes.py"
-        marker = self.home / "heartbeat"
+        helper = self.home / "template_helpers" / "prepare_hermes.py"
+        helper.parent.mkdir()
+        marker = helper.with_name("heartbeat")
         helper.write_text("import time\nfrom pathlib import Path\nwhile True:\n Path(__file__).with_name('heartbeat').write_text(str(time.time()))\n time.sleep(.02)\n")
         with patch.object(self.server, "__file__", str(self.home / "server.py")), \
                 patch.object(self.server, "PREPARATION_TIMEOUT", .5), \
@@ -288,7 +289,7 @@ class UpgradeTests(ConfigSafetyFixture, unittest.IsolatedAsyncioTestCase):
             self.assertFalse(excluded(Path(name)), name)
 
     async def test_operator_retry_command_quotes_provider_from_imported_config(self):
-        import prepare_hermes
+        from template_helpers import prepare_hermes
         events = []
         name = "unknown; echo SYNTHETIC_SHELL_TEXT"
         with patch("hermes_cli.left_core_migration.recover_at_startup"), \

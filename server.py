@@ -638,10 +638,12 @@ def write_config_yaml(
         merged_model = {"default": ""}
     else:
         merged_model = dict(merged.get("model") if isinstance(merged.get("model"), dict) else {})
-        saved_default = merged_model.get("default")
-        if preserve_model and isinstance(saved_default, str) and saved_default.strip():
-            model = saved_default
-        merged_model["default"] = model
+        # Restarts must not replay a stale .env model over a native-dashboard
+        # selection. Only an explicit setup edit owns model changes.
+        preserving_model = preserve_model and bool(merged_model.get("default") or merged_model.get("model"))
+        if not preserving_model:
+            if model or not preserve_model:
+                merged_model["default"] = model
         current_provider = str(merged_model.get("provider") or "").strip()
         # Only default to "auto" on a config that has never had a provider
         # pinned. Once a provider is set explicitly — either by
@@ -705,21 +707,16 @@ def write_config_yaml(
                 )
                 merged_model["api_key"] = data.get(custom_style_key, "").strip()
                 current_provider = "custom"
-        # A known built-in provider (openrouter, minimax, nvidia, …) resolves
-        # its endpoint + credentials from the provider itself, so any inline
-        # model.base_url/api_key/api_mode is stale. base_url "takes precedence
-        # over provider" upstream (hermes_cli/config.py), so a leftover — e.g.
-        # a former `base_url: https://openrouter.ai/api/v1` from the hermes
-        # dashboard — silently misroutes EVERY provider you later switch to
-        # (all calls forced to that endpoint regardless of the active model).
-        # Strip them here, mirroring hermes' own clear_model_endpoint_credentials()
-        # on a switch-away-from-custom. Skipped only for "custom"/"local" —
-        # hermes' own convention for a user-supplied (or fixed-URL aggregator)
-        # endpoint that legitimately needs its own base_url/api_key set
-        # directly on model.* (see the "custom_style_key" branch above —
-        # hermes' runtime resolver reads model.base_url/api_key directly, NOT
-        # the separate custom_providers[] block below, which is display-only).
-        if current_provider and current_provider.lower() not in ("custom", "local"):
+        # When writing a new built-in assignment, clear old inline routing:
+        # base_url takes precedence over provider upstream, so a former custom
+        # endpoint can silently misroute the newly selected model. Custom/local
+        # providers instead need their inline endpoint and credentials; the
+        # separate custom_providers[] catalog does not supply runtime routing.
+        # Hermes v0.22.2 writes routing fields even for built-ins (Codex writes
+        # base_url/api_mode). A restart or unrelated save must keep the entire
+        # saved assignment; explicit selections still clear stale routing here
+        # or through Hermes' own model/set transaction below.
+        if not preserving_model and current_provider and current_provider.lower() not in ("custom", "local"):
             for _stale in ("base_url", "api_key", "api", "api_mode"):
                 merged_model.pop(_stale, None)
     merged["model"] = merged_model
@@ -943,7 +940,7 @@ def build_hermes_env() -> dict[str, str]:
     saved later through the setup wizard, since those only ever land in
     HERMES_HOME/.env, not in our own os.environ.
     """
-    from migrate_hermes_configs import IMAGE_EXECUTION_ENV_KEYS, validate_profile_execution_environment
+    from template_helpers.migrate_hermes_configs import IMAGE_EXECUTION_ENV_KEYS, validate_profile_execution_environment
 
     validate_profile_execution_environment(Path(HERMES_HOME))
     env = {**os.environ, "HERMES_HOME": HERMES_HOME}
@@ -1232,39 +1229,43 @@ def _save_xai_oauth_bundle(tokens: dict, model: str) -> None:
     This is a best-effort filesystem transaction: if rollback itself fails,
     surface that explicitly instead of claiming the old state was restored.
     """
-    config_path = Path(HERMES_HOME) / "config.yaml"
-    auth_path = Path(HERMES_HOME) / "auth.json"
-    _read_config_for_write(config_path)
-    paths = (auth_path, config_path, ENV_FILE)
-    snapshots = {path: _file_snapshot(path) for path in paths}
-    written: dict[Path, tuple[bytes, int] | None] = {}
+    from hermes_cli.auth import _auth_store_lock
 
-    def mark_config_saved() -> None:
-        written[config_path] = None
-        written[config_path] = _file_snapshot(config_path)
+    # Share the native cross-process lock with rotating OAuth grants.
+    with _auth_store_lock(target_path=Path(HERMES_HOME) / "auth.json"):
+        config_path = Path(HERMES_HOME) / "config.yaml"
+        auth_path = Path(HERMES_HOME) / "auth.json"
+        _read_config_for_write(config_path)
+        paths = (auth_path, config_path, ENV_FILE)
+        snapshots = {path: _file_snapshot(path) for path in paths}
+        written: dict[Path, tuple[bytes, int] | None] = {}
 
-    try:
-        _save_xai_auth_json(tokens)
-        written[auth_path] = None
-        written[auth_path] = _file_snapshot(auth_path)
-        _apply_xai_oauth_config(model, on_config_saved=mark_config_saved)
-    except Exception as exc:
-        failures = []
-        for path in reversed(paths):
-            if path not in written:
-                continue
-            try:
-                if written[path] is None:
-                    failures.append(f"{path.name} could not be verified after write; left untouched")
-                elif _file_snapshot(path) == written[path]:
-                    _restore_file_snapshot(path, snapshots[path])
-                else:
-                    failures.append(f"{path.name} changed concurrently; left untouched")
-            except (OSError, ValueError) as restore_exc:
-                failures.append(f"{path.name}: {restore_exc}")
-        if failures:
-            raise RuntimeError(f"{exc}; rollback incomplete ({'; '.join(failures)})") from exc
-        raise
+        def mark_config_saved() -> None:
+            written[config_path] = None
+            written[config_path] = _file_snapshot(config_path)
+
+        try:
+            _save_xai_auth_json(tokens)
+            written[auth_path] = None
+            written[auth_path] = _file_snapshot(auth_path)
+            _apply_xai_oauth_config(model, on_config_saved=mark_config_saved)
+        except Exception as exc:
+            failures = []
+            for path in reversed(paths):
+                if path not in written:
+                    continue
+                try:
+                    if written[path] is None:
+                        failures.append(f"{path.name} could not be verified after write; left untouched")
+                    elif _file_snapshot(path) == written[path]:
+                        _restore_file_snapshot(path, snapshots[path])
+                    else:
+                        failures.append(f"{path.name} changed concurrently; left untouched")
+                except (OSError, ValueError) as restore_exc:
+                    failures.append(f"{path.name}: {restore_exc}")
+            if failures:
+                raise RuntimeError(f"{exc}; rollback incomplete ({'; '.join(failures)})") from exc
+            raise
 
 
 async def _poll_xai_device_auth(state: dict) -> None:
@@ -1301,7 +1302,7 @@ async def _poll_xai_device_auth(state: dict) -> None:
                     async with cfg_lock:
                         if state is not _xai_oauth_state or preparation["state"] != "ready":
                             return
-                        _save_xai_oauth_bundle(tokens, state.get("model", ""))
+                        await asyncio.to_thread(_save_xai_oauth_bundle, tokens, state.get("model", ""))
                         state["status"] = "authorized"
                     await gw.restart()
                     await dash.restart()
@@ -1331,13 +1332,11 @@ async def _poll_xai_device_auth(state: dict) -> None:
     print("[xai-oauth] device code expired", flush=True)
 
 
-async def api_oauth_xai_delete(request: Request) -> Response:
-    global _xai_oauth_state
-    if err := guard(request):
-        return err
+def _delete_xai_credentials() -> Response | None:
+    from hermes_cli.auth import _auth_store_lock
+
     auth_path = Path(HERMES_HOME) / "auth.json"
-    async with lifecycle_lock, cfg_lock:
-        if err := guard(request): return err
+    with _auth_store_lock(target_path=auth_path):
         try:
             auth_before = _file_snapshot(auth_path)
             _file_snapshot(ENV_FILE)  # refuse a linked or non-regular env file
@@ -1374,9 +1373,22 @@ async def api_oauth_xai_delete(request: Request) -> Response:
             if restore_errors:
                 return JSONResponse({"error": f"Could not disconnect xAI safely: {exc}; rollback incomplete ({'; '.join(restore_errors)})"}, status_code=500)
             return JSONResponse({"error": f"Could not disconnect xAI safely: {exc}"}, status_code=500)
+    return None
+
+
+async def api_oauth_xai_delete(request: Request) -> Response:
+    global _xai_oauth_state
+    if err := guard(request): return err
+    async with lifecycle_lock, cfg_lock:
+        if err := guard(request): return err
+        try:
+            error = await asyncio.to_thread(_delete_xai_credentials)
+        except Exception:
+            return JSONResponse({"error": "Could not access the credential store. Retry after other authorization work finishes."}, status_code=503)
+        if error is not None:
+            return error
         _xai_oauth_state = None
     return JSONResponse({"ok": True})
-
 
 async def api_oauth_xai_start(request: Request) -> Response:
     global _xai_oauth_state
@@ -1422,6 +1434,8 @@ async def api_oauth_xai_start(request: Request) -> Response:
     }
     async with lifecycle_lock, cfg_lock:
         if err := guard(request): return err
+        if _codex_session is not None:
+            return JSONResponse({"error": "Finish or cancel the ChatGPT authorization first."}, status_code=409)
         _xai_oauth_state = state
     asyncio.create_task(_poll_xai_device_auth(state))
 
@@ -1446,6 +1460,64 @@ async def api_oauth_xai_status(request: Request) -> Response:
     })
 
 
+def configured_model() -> tuple[str, str]:
+    config = _read_config_for_write(Path(HERMES_HOME) / "config.yaml")
+    model = config.get("model", {})
+    if not isinstance(model, dict):
+        return "", ""
+    return str(model.get("default") or model.get("model") or "").strip(), str(model.get("provider") or "").strip().lower()
+
+
+def config_revision() -> str:
+    """Reject stale setup forms without putting credentials in the response."""
+    digest = _hashlib.sha256()
+    for path in (ENV_FILE, Path(HERMES_HOME) / "config.yaml"):
+        snapshot = _file_snapshot(path)
+        content = snapshot[0] if snapshot is not None else b""
+        digest.update(str(len(content)).encode() + b":" + content)
+    return digest.hexdigest()
+
+
+def _codex_connected(*, allow_access_only: bool = False) -> bool:
+    """Stored OAuth authorization, not a live entitlement/availability probe.
+
+    v0.22.2's get_codex_auth_status calls load_pool, which can seed/heal and
+    persist credentials despite its read-only docstring. Inspect a regular-file
+    snapshot instead: setup polling must not mutate or refresh a grant. Native
+    Hermes remains responsible for validating/refreshing it on actual use.
+    """
+    try:
+        snapshot = _file_snapshot(Path(HERMES_HOME) / "auth.json")
+        data = json.loads(snapshot[0]) if snapshot else {}
+        if not isinstance(data, dict):
+            return False
+        pool = data.get("credential_pool")
+        entries = pool.get("openai-codex", []) if isinstance(pool, dict) else []
+        entries = [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+        providers = data.get("providers")
+        state = providers.get("openai-codex", {}) if isinstance(providers, dict) else {}
+        tokens = state.get("tokens", {}) if isinstance(state, dict) else {}
+        candidates = [entry for entry in entries if entry.get("last_status") != "dead"]
+        if isinstance(tokens, dict) and not any(
+                entry.get("last_status") == "dead" and entry.get("access_token") == tokens.get("access_token")
+                for entry in entries):
+            candidates.append(tokens)
+        if any(all(isinstance(entry.get(key), str) and entry[key].strip()
+                   for key in ("access_token", "refresh_token")) for entry in candidates):
+            return True
+        if allow_access_only:
+            # Native Codex also accepts manually managed/gateway pool keys.
+            # Preserve those existing deployments without presenting them as a
+            # durable ChatGPT OAuth login in the setup card.
+            from hermes_cli.auth_codex import _codex_access_token_is_expiring
+            return any(isinstance(entry.get("access_token"), str) and entry["access_token"].strip()
+                       and not _codex_access_token_is_expiring(entry["access_token"], 0)
+                       for entry in entries if entry.get("last_status") != "dead")
+        return False
+    except (OSError, ValueError):
+        return False
+
+
 def is_config_complete(data: dict[str, str] | None = None) -> bool:
     """Single source of truth for 'ready to run the gateway'.
 
@@ -1453,7 +1525,15 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
     """
     if data is None:
         data = read_env(ENV_FILE)
-    has_model = bool(data.get("LLM_MODEL"))
+    try:
+        model, provider = configured_model()
+    except ValueError:
+        return False
+    has_model = bool(data.get("LLM_MODEL")) or bool(model and provider not in {"", "auto"})
+    if provider == "openai-codex":
+        return bool(model) and _codex_connected(allow_access_only=True)
+    if provider == "xai-oauth":
+        return has_model and _has_xai_oauth_tokens()
     has_provider = any(
         _router_provider_is_configured(data, k) if k in MANAGED_ROUTER_PROVIDERS else bool(data.get(k))
         for k in PROVIDER_KEYS
@@ -1746,7 +1826,11 @@ class Gateway:
         self._stopping = False
         try:
             env = build_hermes_env()
-            model = env.get("LLM_MODEL", "")
+            if configured_model()[1] == "openai-codex" and not _codex_connected(allow_access_only=True):
+                self.state = "stopped"
+                self.logs.append("[gateway] ChatGPT authorization is missing. Reconnect from Setup.")
+                return False
+            model = configured_model()[0] or env.get("LLM_MODEL", "")
             provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
             print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
             # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
@@ -2022,7 +2106,7 @@ async def _prepare_hermes(mode: str) -> bool:
     try:
         proc = await asyncio.create_subprocess_exec(
             os.environ.get("HERMES_PYTHON", sys.executable),
-            "-E", "-s", str(Path(__file__).with_name("prepare_hermes.py")), "--mode", mode,
+            "-E", "-s", str(Path(__file__).parent / "template_helpers" / "prepare_hermes.py"), "--mode", mode,
             env={**os.environ, "HERMES_HOME": HERMES_HOME},
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -2308,6 +2392,7 @@ async def set_active_model_via_hermes(
             headers["cookie"] = "; ".join(f"{k}={v}" for k, v in session.items())
         return await client.post(
             f"{HERMES_DASHBOARD_URL}/api/model/set",
+            params={"profile": "default"},
             json={
                 "scope": "main",
                 "provider": provider_id,
@@ -2345,6 +2430,236 @@ async def set_active_model_via_hermes(
     return None
 
 
+# ── ChatGPT setup: Hermes owns the OAuth protocol and credential store ─────────
+_codex_session: dict | None = None  # only non-secret, temporary device-flow metadata
+_CODEX_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+
+
+class HermesAPIError(Exception):
+    def __init__(self, message: str, status_code: int = 503):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+async def _codex_api(method: str, path: str, *, params: dict | None = None) -> dict:
+    """Bounded loopback calls using the same gated/ungated auth as model/set.
+
+    Never forward an upstream error body: auth errors can contain credentials.
+    The explicit default profile also avoids implicit-profile worker context
+    differences in Hermes v0.22.2. No browser-supplied URL or profile is accepted.
+    """
+    try:
+        token = await _get_hermes_session_token()
+
+        async def send(session):
+            headers = {_SESSION_TOKEN_HEADER: token} if token else {}
+            if session:
+                headers["cookie"] = "; ".join(f"{k}={v}" for k, v in session.items())
+            return await get_http_client().request(
+                method, f"{HERMES_DASHBOARD_URL}{path}", headers=headers,
+                params={**(params or {}), "profile": "default"}, timeout=httpx.Timeout(25.0),
+            )
+
+        generation, session = hermes_session.snapshot()
+        response = await send(session)
+        if response.status_code == 401 and await hermes_session.refresh(generation):
+            token = await _get_hermes_session_token()
+            _, session = hermes_session.snapshot()
+            response = await send(session)
+    except httpx.HTTPError as exc:
+        raise HermesAPIError("Hermes could not be reached. Wait for the dashboard to start, then retry.") from exc
+    if response.status_code == 404:
+        raise HermesAPIError("This authorization session has ended. Connect again to get a new code.", 404)
+    if response.status_code >= 400:
+        raise HermesAPIError(
+            "Hermes could not complete the request. For login, enable device-code authorization in your ChatGPT security or workspace settings, then retry.",
+            502 if response.status_code >= 500 else 409,
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HermesAPIError("Hermes returned an invalid response. Retry the request.", 502) from exc
+    if not isinstance(payload, dict):
+        raise HermesAPIError("Hermes returned an invalid response. Retry the request.", 502)
+    return payload
+
+
+async def _cancel_codex_session() -> None:
+    global _codex_session
+    if _codex_session is None:
+        return
+    session = _codex_session
+    try:
+        result = await _codex_api("DELETE", f"/api/providers/oauth/sessions/{session['session_id']}")
+    except HermesAPIError as exc:
+        if exc.status_code != 404:
+            raise
+    else:
+        if result.get("ok") is not True and result.get("message") != "session not found":
+            raise HermesAPIError("Cancellation was not confirmed. Check authorization status before retrying.")
+    if _codex_session is session:
+        _codex_session = None
+
+
+async def api_oauth_codex_status(request: Request) -> Response:
+    global _codex_session
+    if err := guard(request): return err
+    if preparation["state"] != "ready":
+        return JSONResponse({"error": "Wait for Hermes preparation to finish."}, status_code=503)
+    try:
+        model, provider = configured_model()
+        result = {"connected": await asyncio.to_thread(_codex_connected),
+                  "model": model if provider == "openai-codex" else "",
+                  "config_revision": config_revision()}
+        session = _codex_session
+        if session is not None:
+            try:
+                progress = await _codex_api("GET", f"/api/providers/oauth/openai-codex/poll/{session['session_id']}")
+            except HermesAPIError as exc:
+                if exc.status_code != 404:
+                    raise
+                progress = {"status": "expired"}
+            # A response from before a cancel/new attempt cannot revive its code.
+            if _codex_session is session:
+                state = progress.get("status")
+                if state == "pending":
+                    return JSONResponse({**result, **session, "status": "waiting"})
+                _codex_session = None
+                if state != "approved":
+                    return JSONResponse({**result, "status": state if state in {"expired", "denied"} else "error",
+                                         "error": "Authorization ended. If it failed, check ChatGPT device-login permissions, then connect again."})
+                result["connected"] = await asyncio.to_thread(_codex_connected)
+        return JSONResponse({**result, "status": "connected" if result["connected"] else "not_connected"})
+    except (HermesAPIError, ValueError, OSError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=getattr(exc, "status_code", 503))
+
+
+async def api_oauth_codex_start(request: Request) -> Response:
+    global _codex_session
+    if err := guard(request): return err
+    async with lifecycle_lock:
+        if err := guard(request): return err
+        if _codex_session is not None:
+            return await api_oauth_codex_status(request)
+        if _xai_oauth_state and _xai_oauth_state.get("status") == "pending":
+            return JSONResponse({"error": "Finish or cancel the xAI authorization first."}, status_code=409)
+        try:
+            try:
+                body = await request.json()
+            except (ValueError, AttributeError):
+                body = {}
+            previous_revision = config_revision()
+            revision = body.get("_config_revision") if isinstance(body, dict) else None
+            if revision is not None and not isinstance(revision, str):
+                return JSONResponse({"error": "Invalid settings revision."}, status_code=400)
+            if revision is not None and revision != previous_revision:
+                return JSONResponse({"error": "Settings changed. Reload before connecting ChatGPT."}, status_code=409)
+            model, provider = configured_model()
+            if model and provider in {"", "auto"} and is_config_complete():
+                # Native login updates auth.active_provider. Freeze a legacy
+                # auto choice first so approval cannot switch an existing model.
+                from hermes_cli.auth import resolve_provider
+                try:
+                    resolved = await asyncio.to_thread(resolve_provider, "auto")
+                except Exception as exc:
+                    raise HermesAPIError("Could not resolve the current provider. Select it in the Hermes dashboard before connecting ChatGPT.") from exc
+                if await set_active_model_via_hermes(resolved, model):
+                    raise HermesAPIError("Could not preserve the current provider. Select it in the Hermes dashboard, then reconnect.")
+            preserved_revision = config_revision()
+            payload = await _codex_api("POST", "/api/providers/oauth/openai-codex/start")
+            sid, code = payload.get("session_id"), payload.get("user_code")
+            url = _urlparse(str(payload.get("verification_url") or ""))
+            if (not isinstance(sid, str) or not _CODEX_SESSION_ID.fullmatch(sid)
+                    or not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9-]{3,64}", code)
+                    or url.scheme != "https" or url.netloc != "auth.openai.com"):
+                raise HermesAPIError("Hermes returned an invalid authorization code. Retry login.", 502)
+            expires, interval = payload.get("expires_in", 900), payload.get("poll_interval", 5)
+            if type(expires) is not int or type(interval) is not int:
+                raise HermesAPIError("Hermes returned an invalid authorization expiry. Retry login.", 502)
+            _codex_session = {"session_id": sid, "user_code": code, "verification_url": url.geturl(),
+                              "expires_at": time.time() + min(900, max(1, expires)),
+                              "poll_interval": min(30, max(3, interval))}
+            return JSONResponse({**_codex_session, "status": "waiting", "config_revision": preserved_revision,
+                                 "previous_revision": previous_revision})
+        except (HermesAPIError, ValueError, OSError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=getattr(exc, "status_code", 503))
+
+
+async def api_oauth_codex_cancel(request: Request) -> Response:
+    if err := guard(request): return err
+    async with lifecycle_lock:
+        if err := guard(request): return err
+        try:
+            await _cancel_codex_session()
+        except HermesAPIError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
+    return JSONResponse({"ok": True})
+
+
+async def _codex_models() -> list[str]:
+    payload = await _codex_api("GET", "/api/model/options", params={"explicit_only": "true"})
+    rows = payload.get("providers", [])
+    if not isinstance(rows, list):
+        raise HermesAPIError("Hermes returned an invalid model list. Reload it and try again.", 502)
+    for row in rows:
+        if isinstance(row, dict) and row.get("slug") == "openai-codex":
+            unavailable = row.get("unavailable_models") or []
+            if not isinstance(row.get("models", []), list):
+                raise HermesAPIError("Hermes returned an invalid model list. Reload it and try again.", 502)
+            return list(dict.fromkeys(model for model in row.get("models", [])
+                                      if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9_./:-]{1,200}", model)
+                                      and model not in unavailable))
+    return []
+
+
+async def api_oauth_codex_models(request: Request) -> Response:
+    if err := guard(request): return err
+    async with lifecycle_lock:
+        if preparation["state"] != "ready":
+            return JSONResponse({"error": "Wait for Hermes preparation to finish."}, status_code=503)
+        try:
+            if not await asyncio.to_thread(_codex_connected):
+                return JSONResponse({"error": "Connect ChatGPT before loading models."}, status_code=409)
+            return JSONResponse({"models": await _codex_models()})
+        except HermesAPIError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
+
+
+async def api_oauth_codex_delete(request: Request) -> Response:
+    global _codex_session
+    if err := guard(request): return err
+    if backup_lock.locked():
+        return JSONResponse({"error": "Wait for the backup or restore to finish."}, status_code=409)
+    async with backup_lock, lifecycle_lock:
+        if err := guard(request): return err
+        try:
+            model, provider = configured_model()
+            snapshot = _file_snapshot(Path(HERMES_HOME) / "auth.json")
+            if snapshot is not None and not isinstance(json.loads(snapshot[0]), dict):
+                raise ValueError("auth.json is invalid. Repair it before disconnecting; no credentials were removed.")
+            pid, error = await _gateway_maintenance_check()
+            if error is not None: return error
+            await _cancel_codex_session()
+            was_running = gw.state == "starting" or (gw.proc is not None and gw.proc.returncode is None) or pid is not None
+            # Stop all credential holders BEFORE deleting the grant. Otherwise a
+            # chat/gateway refresh can publish it again after 'Disconnect'.
+            dashboard_stopped = await dash.stop()
+            await _stop_gateway_for_maintenance(dashboard_stopped=dashboard_stopped)
+            _codex_session = None
+            from hermes_cli.auth import clear_provider_auth
+            await asyncio.to_thread(clear_provider_auth, "openai-codex")
+            if await dash.start() is False:
+                raise RuntimeError("Authorization removed, but the dashboard could not restart. Check Logs.")
+            if was_running and provider != "openai-codex":
+                if await gw.start(write_config=False) is False:
+                    raise RuntimeError("Authorization removed, but the gateway could not restart. Check Logs.")
+            return JSONResponse({"ok": True})
+        except (HermesAPIError, ValueError, OSError, RuntimeError) as exc:
+            # Restore UI access, but never restart inference with uncertain auth.
+            await dash.start()
+            return JSONResponse({"error": str(exc)}, status_code=getattr(exc, "status_code", 503))
+
+
 # ── Route handlers ────────────────────────────────────────────────────────────
 async def page_index(request: Request):
     if err := guard(request): return err
@@ -2362,19 +2677,33 @@ async def api_config_get(request: Request):
     async with cfg_lock:
         if preparation["state"] != "ready":
             return JSONResponse({"error": "Hermes is preparing. Settings will load when it finishes."}, status_code=503)
+        revision = config_revision()
         data = read_env(ENV_FILE)
+        try:
+            model, provider = configured_model()
+            if revision != config_revision():
+                return JSONResponse({"error": "Settings changed while loading. Reload the page."}, status_code=409)
+        except (ValueError, OSError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
     defs = [{"key": k, "label": l, "category": c, "secret": s} for k, l, c, s in ENV_VARS]
-    return JSONResponse({"vars": mask(data), "defs": defs})
+    return JSONResponse({"vars": mask(data), "defs": defs, "config_revision": revision,
+                         "config_complete": is_config_complete(data),
+                         "model_config": {"model": model, "provider": provider}})
 
 
 async def api_config_put(request: Request):
     if err := guard(request): return err
     async with lifecycle_lock:
         if err := guard(request): return err
+        rollback_files = ()
+        strict_pin = False
         try:
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        if not isinstance(body, dict) or not isinstance(body.get("vars", {}), dict) or any(
+                not isinstance(k, str) or not isinstance(v, str) for k, v in body.get("vars", {}).items()):
+            return JSONResponse({"error": "Settings must be a mapping of text values."}, status_code=400)
         try:
             restart = body.pop("_restart", False)
             # Set by the setup wizard to the ENV_VARS key of whichever provider's
@@ -2382,15 +2711,66 @@ async def api_config_put(request: Request):
             # — empty when the user saved without touching a provider (e.g. just
             # toggling a messaging channel). See set_active_model_via_hermes().
             active_provider_key = str(body.pop("_active_provider_key", "") or "").strip()
+            if active_provider_key and active_provider_key not in HERMES_PROVIDER_IDS:
+                return JSONResponse({"error": "Unsupported provider."}, status_code=400)
+            oauth_provider = str(body.pop("_active_oauth_provider", "") or "").strip()
+            if oauth_provider not in {"", "openai-codex"} or (oauth_provider and active_provider_key):
+                return JSONResponse({"error": "Choose one supported provider."}, status_code=400)
+            # Explicit intent from the setup UI: True = the user deliberately
+            # assigned vars.LLM_MODEL to the selected provider, False = credential
+            # or other edit only (a populated LLM_MODEL is then just a stale hint).
+            # Absent = legacy API client, which keeps the inferred behaviour below.
+            # Presence is tested separately from value: an explicit JSON null is a
+            # supplied non-Boolean and is rejected, not treated as absent.
+            model_assignment = None
+            if "_model_assignment" in body:
+                model_assignment = body.pop("_model_assignment")
+                if not isinstance(model_assignment, bool):
+                    return JSONResponse({"error": "Invalid model assignment flag."}, status_code=400)
+            if model_assignment is False and oauth_provider:
+                return JSONResponse({"error": "Choosing a ChatGPT model requires model assignment."}, status_code=400)
+            revision = body.pop("_config_revision", None)
+            if revision is not None and not isinstance(revision, str):
+                return JSONResponse({"error": "Invalid settings revision."}, status_code=400)
+            if revision is None and getattr(request, "headers", {}).get("referer"):
+                return JSONResponse({"error": "This setup page is outdated. Reload before saving; existing settings were not changed."}, status_code=409)
+            if revision is not None and revision != config_revision():
+                return JSONResponse({"error": "Settings changed since this page loaded. Reload before saving; your saved settings were not changed."}, status_code=409)
             new_vars = body.get("vars", {})
+            if oauth_provider:
+                if not await asyncio.to_thread(_codex_connected):
+                    return JSONResponse({"error": "Connect ChatGPT before saving."}, status_code=409)
+                if new_vars.get("LLM_MODEL", "").strip() not in await _codex_models():
+                    return JSONResponse({"error": "Choose a ChatGPT model from the model list, then retry."}, status_code=409)
             async with cfg_lock:
+                if revision is not None and revision != config_revision():
+                    return JSONResponse({"error": "Settings changed while saving. Reload before trying again."}, status_code=409)
                 config_path = Path(HERMES_HOME) / "config.yaml"
                 current_cfg = _read_config_for_write(config_path)
                 existing = read_env(ENV_FILE)
+                current_model, current_provider = configured_model()
+                strict_pin = bool(oauth_provider or current_provider == "openai-codex")
+                # A provider pick is a genuine model selection only when the save
+                # also submits a non-empty LLM_MODEL; a key-only save must not
+                # replay the stale .env model onto the provider.
+                submitted_model = str(new_vars.get("LLM_MODEL") or "").strip() if isinstance(new_vars, dict) else ""
+                if model_assignment is not None:
+                    # Declared intent wins over inference, even when a stale
+                    # populated LLM_MODEL differs from the saved pair.
+                    explicit_model = bool(model_assignment and (submitted_model or oauth_provider))
+                else:
+                    explicit_model = bool(oauth_provider) or bool(active_provider_key and submitted_model) or (
+                        bool(submitted_model) and submitted_model not in {existing.get("LLM_MODEL", ""), current_model})
+                if current_provider == "openai-codex" and explicit_model and not (active_provider_key or oauth_provider):
+                    return JSONResponse({"error": "Choose ChatGPT or another provider before changing its model."}, status_code=409)
                 merged = unmask(new_vars, existing)
                 for k, v in existing.items():
                     if k not in merged:
                         merged[k] = v
+                if not explicit_model and current_model:
+                    merged["LLM_MODEL"] = current_model
+                if oauth_provider:
+                    merged["_MODEL_OPENAI_CODEX"] = merged["LLM_MODEL"].strip()
                 # Removing the router that currently owns model.provider must not
                 # leave a dangling provider id + model behind. That state looks
                 # configured to the supervisor but can never resolve at runtime.
@@ -2430,44 +2810,34 @@ async def api_config_put(request: Request):
                             {"error": f"{router_spec['name']}: {url_error}"},
                             status_code=400,
                         )
-                previous_env = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else None
+                previous_env = _file_snapshot(ENV_FILE)
+                previous_config = _file_snapshot(config_path)
                 write_env(ENV_FILE, merged)
                 try:
-                    # An explicit model selection updates the desired model: either
-                    # LLM_MODEL actually changed, or the UI flagged a provider/model
-                    # pick (_active_provider_key) and sent LLM_MODEL — even if it
-                    # equals the stale .env value while native YAML differs.
-                    # Other saves must not overwrite a model chosen natively in
-                    # Hermes with a stale .env value.
-                    model_changed = merged.get("LLM_MODEL", "") != existing.get("LLM_MODEL", "")
-                    explicit_selection = bool(
-                        active_provider_key
-                        and isinstance(new_vars, dict)
-                        and "LLM_MODEL" in new_vars
-                        and merged.get("LLM_MODEL", "").strip()
-                    )
-                    write_config_yaml(
-                        merged,
-                        reset_model=reset_removed_router_model,
-                        preserve_model=not (model_changed or explicit_selection),
-                    )
+                    # Keep the old model/provider pair until the native API
+                    # atomically commits an explicit OAuth switch. Our staged
+                    # write must not masquerade as a successful native pin.
+                    # Non-explicit saves (key-only, stale .env LLM_MODEL) keep
+                    # the saved native model/provider pair untouched.
+                    write_config_yaml(merged, reset_model=reset_removed_router_model, preserve_model=strict_pin or not explicit_model)
                 except Exception:
                     # Config and .env are separate files. If the guarded config
                     # write refuses or fails, restore the exact prior credentials
                     # rather than leaving the next boot with a half-saved setup.
-                    if previous_env is None:
-                        ENV_FILE.unlink(missing_ok=True)
-                    else:
-                        _atomic_write_text(ENV_FILE, previous_env)
+                    _restore_file_snapshot(ENV_FILE, previous_env)
                     raise
+                written_env = _file_snapshot(ENV_FILE)
+                written_config = _file_snapshot(config_path)
+                if strict_pin:
+                    rollback_files = ((ENV_FILE, previous_env, written_env), (config_path, previous_config, written_config))
 
             model_warning = None
-            hermes_provider_id = HERMES_PROVIDER_IDS.get(active_provider_key)
+            hermes_provider_id = oauth_provider or HERMES_PROVIDER_IDS.get(active_provider_key)
             model_value = merged.get("LLM_MODEL", "").strip()
             # Pin only a genuine provider+model pick. A provider key saved without
             # LLM_MODEL would otherwise replay the stale .env model onto the
             # provider and overwrite the pair chosen natively in Hermes.
-            if hermes_provider_id and model_value and explicit_selection:
+            if hermes_provider_id and model_value and explicit_model:
                 pin_base_url = ""
                 pin_api_key = ""
                 if hermes_provider_id == "custom":
@@ -2479,6 +2849,18 @@ async def api_config_put(request: Request):
                 model_warning = await set_active_model_via_hermes(
                     hermes_provider_id, model_value, base_url=pin_base_url, api_key=pin_api_key
                 )
+                if oauth_provider or current_provider == "openai-codex":
+                    # A timeout can arrive AFTER Hermes commits the model. Read
+                    # back the file before deciding whether the pin failed.
+                    applied_model, applied_provider = configured_model()
+                    if (applied_model, applied_provider) != (model_value, hermes_provider_id):
+                        async with cfg_lock:
+                            if _file_snapshot(ENV_FILE) == written_env:
+                                _restore_file_snapshot(ENV_FILE, previous_env)
+                            if _file_snapshot(config_path) == written_config:
+                                _restore_file_snapshot(config_path, previous_config)
+                        return JSONResponse({"error": "Hermes could not confirm the provider change. Existing credentials were retained. Reload settings and retry."}, status_code=503)
+                    model_warning = None
                 # Log the outcome either way. A failed pin is a SILENT downgrade —
                 # hermes falls back to provider auto-resolution, which works for a
                 # single-provider setup and fails opaquely for custom endpoints
@@ -2491,7 +2873,12 @@ async def api_config_put(request: Request):
                     print(f"[config] provider pin ok — provider={hermes_provider_id} "
                           f"model={model_value!r}", flush=True)
 
+            # The save is committed. A later process-start failure must not
+            # roll back credentials underneath an already-started child.
+            rollback_files = ()
             if restart:
+                if not is_config_complete(merged):
+                    return JSONResponse({"ok": True, "restarting": False, "warning": "Settings saved. Complete provider authorization and model selection before starting Hermes."})
                 gateway_started = await gw.restart()
                 # The dashboard (and its embedded Chat tab) only ever sees the env
                 # it was spawned with — a newly-saved provider key doesn't reach
@@ -2499,11 +2886,19 @@ async def api_config_put(request: Request):
                 dashboard_started = await dash.restart()
                 if gateway_started is False or dashboard_started is False:
                     model_warning = (model_warning + " " if model_warning else "") + "Settings saved, but Hermes could not restart. Check Logs and deployment logs."
-            resp = {"ok": True, "restarting": restart}
+            resp = {"ok": True, "restarting": restart, "config_revision": config_revision(),
+                    "config_complete": is_config_complete(merged)}
             if model_warning:
                 resp["warning"] = model_warning
             return JSONResponse(resp)
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
+            # Roll back our own staged bytes only. An independent native writer
+            # may have saved newer data while the model API was in flight.
+            for path, previous, written in rollback_files:
+                if _file_snapshot(path) == written:
+                    _restore_file_snapshot(path, previous)
+            if isinstance(e, asyncio.CancelledError):
+                raise
             return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -2695,6 +3090,7 @@ NATIVE_GATEWAY_LIFECYCLE_PATHS = frozenset({
     "/api/gateway/start", "/api/gateway/stop", "/api/gateway/restart",
     "/api/gateway/migrate", "/api/gateway/drain", "/api/webhooks/enable",
 })
+NATIVE_SETUP_WRITE_PATHS = frozenset({"/api/config", "/api/env", "/api/model/set"})
 NATIVE_GATEWAY_ONBOARDING_PATH = re.compile(r"/api/messaging/(?:telegram|whatsapp)/onboarding/[^/]+/apply")
 GATEWAY_STOP_TIMEOUT = 70.0
 
@@ -2833,6 +3229,7 @@ async def api_config_reset(request: Request):
     async with lifecycle_lock:
         if err := guard(request): return err
         try:
+            await _cancel_codex_session()
             async with cfg_lock:
                 _read_config_for_write(Path(HERMES_HOME) / "config.yaml")
                 previous_env = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else None
@@ -4026,13 +4423,14 @@ async def api_backup_restore(request: Request) -> Response:
                     return JSONResponse({"error": message}, status_code=503)
                 preparation.update(previous_preparation)
                 return JSONResponse({"error": f"No import was started; the prior restore recovery state was retained: {publication_error}"}, status_code=503)
-            global _xai_oauth_state
+            global _xai_oauth_state, _codex_session
             _xai_oauth_state = None  # An earlier OAuth poll must not overwrite restored credentials.
             preparation.update(state="running", phase="restore", message="Stopping Hermes before import…")
             # Close native lifecycle admission before stopping the real root
             # gateway. A detached native restart may not be self.proc.
             try:
                 dashboard_stopped = await dash.stop()
+                _codex_session = None  # native device workers stopped with the dashboard
                 await _stop_gateway_for_maintenance(dashboard_stopped=dashboard_stopped)
             except (ImportError, OSError, RuntimeError, ValueError) as exc:
                 preparation.update(previous_preparation)
@@ -4424,12 +4822,16 @@ async def route_root(request: Request) -> Response:
 async def route_proxy(request: Request) -> Response:
     """Catch-all: forward any unmatched path to the Hermes dashboard."""
     if err := guard(request): return err
-    if request.method == "POST" and (
+    settings_write = request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path in NATIVE_SETUP_WRITE_PATHS
+    lifecycle_change = request.method == "POST" and (
         request.url.path in NATIVE_GATEWAY_LIFECYCLE_PATHS
         or NATIVE_GATEWAY_ONBOARDING_PATH.fullmatch(request.url.path)
-    ):
+    )
+    if settings_write or lifecycle_change:
         # Native routes launch detached lifecycle commands. Serialize their
-        # admission with Save/Apply/Restore, then maintenance checks the native
+        # admission with Save/Apply/Restore. Native config/env/model saves share
+        # that lock so the two UIs cannot interleave our staged settings write.
+        # Maintenance then checks the native
         # action registry before stopping Dashboard and touching user state.
         async with lifecycle_lock:
             if err := guard(request): return err
@@ -4765,6 +5167,11 @@ routes = [
     Route("/setup/api/oauth/xai/start",         api_oauth_xai_start,  methods=["POST"]),
     Route("/setup/api/oauth/xai/status",        api_oauth_xai_status),
     Route("/setup/api/oauth/xai",               api_oauth_xai_delete, methods=["DELETE"]),
+    Route("/setup/api/oauth/codex",             api_oauth_codex_status, methods=["GET"]),
+    Route("/setup/api/oauth/codex",             api_oauth_codex_delete, methods=["DELETE"]),
+    Route("/setup/api/oauth/codex/start",       api_oauth_codex_start, methods=["POST"]),
+    Route("/setup/api/oauth/codex/cancel",      api_oauth_codex_cancel, methods=["POST"]),
+    Route("/setup/api/oauth/codex/models",      api_oauth_codex_models),
     Route("/setup/api/backup/jobs",             api_backup_jobs_get, methods=["GET"]),
     Route("/setup/api/backup/jobs",             api_backup_jobs_start, methods=["POST"]),
     Route("/setup/api/backup/jobs/{job_id}",    api_backup_job_delete, methods=["DELETE"]),

@@ -44,7 +44,7 @@ printf 'docker\n' > /data/.hermes/.install_method
 # intact for rollback, but never load its Python 3.12 extensions into 3.14.
 unset HERMES_LAZY_INSTALL_TARGET
 
-# server.py binds /setup and /health before running prepare_hermes.py under a
+# server.py binds /setup and /health before running template_helpers/prepare_hermes.py under a
 # bounded, visible supervisor. That worker settles interrupted PM publication,
 # refreshes the current image's dependencies and migrates root/named configs
 # before either Hermes child can start.

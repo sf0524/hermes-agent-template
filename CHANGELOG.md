@@ -11,6 +11,18 @@ release.
 
 ---
 
+## release/v0.22.2/2 — October 19, 2026
+**Hermes v0.22.2 · minor**
+
+### Improvements
+- Connect ChatGPT from Setup with a one-time code, confirm a Hermes-listed model before starting, and reconnect or disconnect your account.
+
+### Bug fixes
+- Dashboard-selected models and endpoint settings survive gateway restarts and unrelated setup saves; outdated setup forms are rejected before they can overwrite newer settings.
+- Changing or removing a SuperGrok connection preserves other saved OAuth accounts during token refresh.
+
+---
+
 ## release/v0.22.2/1 — October 17, 2026
 **Hermes v0.22.2 · major (Hermes upgrade, from v2026.9.24)**
 

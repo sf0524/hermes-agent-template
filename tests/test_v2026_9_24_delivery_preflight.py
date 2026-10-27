@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    "check_pending_deliveries", ROOT / "check_pending_deliveries.py"
+    "check_pending_deliveries", ROOT / "template_helpers" / "check_pending_deliveries.py"
 )
 assert SPEC and SPEC.loader
 preflight = importlib.util.module_from_spec(SPEC)

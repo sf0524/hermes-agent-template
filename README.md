@@ -27,7 +27,9 @@ For Dockhold, see the [community template](https://github.com/dockhold/hermes-ag
 
 The easiest way to get started:
 
-### 1. Get an LLM Provider Key (free)
+### 1. Choose an LLM provider
+
+For ChatGPT, deploy first, then select **ChatGPT (OAuth)** in Setup and authorize your account; no OpenAI API key is needed. For an API-key provider, OpenRouter offers free models:
 
 1. Register for free at [OpenRouter](https://openrouter.ai/)
 2. Create an API key from your [OpenRouter dashboard](https://openrouter.ai/keys)
@@ -51,7 +53,7 @@ Hermes also has a browser Chat tab. To connect a messaging channel, Telegram is 
 
 ### 4. Configure in the Admin Dashboard
 
-1. **LLM Provider** — select OpenRouter from the dropdown, paste your API key, enter the model name
+1. **LLM Provider** — select ChatGPT (OAuth) and connect your account, or choose an API-key provider such as OpenRouter; then choose or enter its model
 2. **Messaging Channel** — check Telegram, paste the Bot Token from BotFather
 3. Click **Save & Start** — the gateway will start and your bot goes live
 
@@ -77,13 +79,23 @@ All other configuration (LLM provider, model, channels, tools) is managed throug
 
 Selectable from the setup wizard's dropdown:
 
-OpenRouter, Anthropic (Claude), Google AI Studio, xAI (API key **or** SuperGrok OAuth), DeepSeek, Qwen Cloud (DashScope), GLM / Z.AI, Kimi, MiniMax (global **and** China), NVIDIA NIM, Fireworks AI, NovitaAI, Atlas Cloud, Arcee AI, Step Plan, GMI Cloud, Hugging Face, GitHub Copilot, OpenCode Zen, OpenCode Go, Kilo Code, Ollama Cloud, Actual Computer, AWS Bedrock, Azure Foundry, **9Router**, **OmniRoute**, and any OpenAI-compatible **Custom Endpoint**.
+ChatGPT (OAuth), OpenRouter, Anthropic (Claude), Google AI Studio, xAI (API key **or** SuperGrok OAuth), DeepSeek, Qwen Cloud (DashScope), GLM / Z.AI, Kimi, MiniMax (global **and** China), NVIDIA NIM, Fireworks AI, NovitaAI, Atlas Cloud, Arcee AI, Step Plan, GMI Cloud, Hugging Face, GitHub Copilot, OpenCode Zen, OpenCode Go, Kilo Code, Ollama Cloud, Actual Computer, AWS Bedrock, Azure Foundry, **9Router**, **OmniRoute**, and any OpenAI-compatible **Custom Endpoint**.
 
 9Router and OmniRoute are separately deployed routing gateways, not services bundled into this image. Select either one in the setup wizard and enter the gateway's reachable OpenAI-compatible `/v1` URL, its endpoint API key, and a model or combo name. Both can remain configured at the same time; OmniRoute defaults the model field to its `auto` smart-routing alias.
 
 Every other provider Hermes supports can still be configured from the Hermes Dashboard → **Keys** tab — the wizard covers the common ones, not the limit.
 
 > **OpenCode Free:** Hermes v2026.9.21 removed the anonymous `opencode-free` provider because its upstream relay now rejects external anonymous clients. Use OpenCode Zen or OpenCode Go with the corresponding API key instead.
+
+## ChatGPT OAuth
+
+Select **ChatGPT (OAuth)** in `/setup`, click **Connect ChatGPT**, open the verification link and enter the one-time code. Return to Setup, choose a model from Hermes' list and click **Confirm model**. The ready message confirms your selection is saved; **Save & Start** then applies your other settings and starts Hermes. If device login is disabled, enable it in your ChatGPT security settings or ask your workspace administrator. Model access and usage limits depend on your account.
+
+Hermes owns token storage and refresh under `/data/.hermes/auth.json`. Keep the persistent `/data` volume attached across redeploys. Tokens are included in unencrypted backups, so store backups securely. Do not copy the same authorization into concurrently running deployments: refresh tokens rotate. This connection does not import conversations from ChatGPT.
+
+Setup manages the default profile. For named profiles and advanced credential pools, use **Hermes Dashboard → Keys**. **Disconnect** removes all saved Codex authorizations in the default profile, including its pool; named profiles borrowing that login must reconnect. Hermes briefly stops to clear in-memory credentials. If ChatGPT is the default provider, the gateway stays stopped until you reconnect or choose another provider. Chats, files, other API keys and independent named-profile credentials are kept.
+
+Models selected in the native dashboard are preserved across gateway restarts and unrelated setup saves. If Setup reports that settings changed, reload the page before saving to avoid replacing newer configuration.
 
 ## Supported Channels
 
@@ -94,6 +106,8 @@ Telegram, Discord, Slack, WhatsApp, Email, Mattermost, Matrix
 Parallel (search), Firecrawl (scraping), Keenable (search), Tavily (search), Perplexity (search), FAL (image gen), Browserbase, GitHub, OpenAI Voice (Whisper/TTS), Honcho (memory)
 
 ## Architecture
+
+Build and startup utilities live in `template_helpers/`; `server.py` and `start.sh` are the application and entrypoint.
 
 One container runs a single public process that fronts two managed Hermes subprocesses:
 
@@ -149,7 +163,7 @@ Changing the release branch later changes the image, not the `/data` volume. Kee
 
 If you use named profiles, check each profile's `state.db` for outgoing final replies still marked `pending`, `attempting`, or `failed` before upgrading from v2026.9.21. v2026.9.21 could write these replies to a named profile's ledger even though boot recovery already checked the root ledger; v2026.9.24 fixes new writes but does not move old rows. The new image logs an advisory and continues when it finds such rows. A sender can make a new request, but that starts a new agent turn and may repeat tool calls or actions; a reply marked `attempting` may already have been delivered. Resolve important outstanding replies before redeploying, and do not copy rows between databases without a tested recovery plan.
 
-Run `python3 check_pending_deliveries.py --hermes-home /path/to/stopped-volume-copy` on a consistent copy of the old volume. It prints counts without message contents and exits `0` when clear, `2` for advisory outstanding replies, or `3` when a profile could not be checked. Startup continues on `2` and stops on `3`; an unreadable ledger has an unknown impact. Do not treat a live file copy without its SQLite WAL files as a reliable clear result.
+Run `python3 template_helpers/check_pending_deliveries.py --hermes-home /path/to/stopped-volume-copy` on a consistent copy of the old volume. It prints counts without message contents and exits `0` when clear, `2` for advisory outstanding replies, or `3` when a profile could not be checked. Startup continues on `2` and stops on `3`; an unreadable ledger has an unknown impact. Do not treat a live file copy without its SQLite WAL files as a reliable clear result.
 
 Hermes v2026.9.24 distributes Hindsight as a catalog plugin instead of bundling it. Removing the old package from this image does not delete your memory bank or saved Hindsight settings. If any profile selects `memory.provider: hindsight`, Setup shows a notice to check that profile's Memory status and test real recall and retention after the first turn and after a redeploy. Startup checks selected catalog integrations and shows recovery commands. Installation needs lazy installs and network access; if either is unavailable, install Hindsight from the Hermes plugin catalog for each affected profile. Older Hindsight source can still use dependency helpers removed in v0.22.2; review its native plugin update before setup or repair, preserving any custom changes. Source presence alone does not verify recall or external backup coverage. This image runs as root by default, and Hindsight's `local_embedded` mode refuses root; use a supported external or cloud mode unless you have customized the runtime user.
 

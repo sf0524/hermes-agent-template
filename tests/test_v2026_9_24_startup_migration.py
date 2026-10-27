@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    "template_config_migrator", ROOT / "migrate_hermes_configs.py"
+    "template_config_migrator", ROOT / "template_helpers" / "migrate_hermes_configs.py"
 )
 assert SPEC and SPEC.loader
 migration = importlib.util.module_from_spec(SPEC)
